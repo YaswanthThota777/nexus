@@ -1,10 +1,3 @@
-const ACTIONS = [
-  { dx: 1, dy: 0, dz: 0 },
-  { dx: -1, dy: 0, dz: 0 },
-  { dx: 0, dy: 1, dz: 1 },
-  { dx: 0, dy: -1, dz: -1 },
-];
-
 const MODEL_PRESETS = {
   ppo: { alpha: 0.24, gamma: 0.93, epsilon: 0.35, epsilonMin: 0.05, epsilonDecay: 0.9965, stepSize: 0.8 },
   sac: { alpha: 0.28, gamma: 0.95, epsilon: 0.22, epsilonMin: 0.03, epsilonDecay: 0.997, stepSize: 0.9 },
@@ -32,23 +25,50 @@ function stateKey(agentPos, goalPos, is2D) {
   return `${deltaX}|${deltaSecondAxis}`;
 }
 
-function getQValues(qTable, key) {
-  if (!qTable.has(key)) qTable.set(key, [0, 0, 0, 0]);
-  return qTable.get(key);
+function clamp(value, min = -1, max = 1) {
+  return Math.max(min, Math.min(max, value));
 }
 
-function chooseAction(values, epsilon, randomFn) {
+function directionSignal(agentPos, goalPos, is2D) {
+  const deltaX = goalPos[0] - agentPos[0];
+  const deltaSecondAxis = is2D ? (goalPos[1] - agentPos[1]) : (goalPos[2] - agentPos[2]);
+  const magnitude = Math.max(0.0001, Math.hypot(deltaX, deltaSecondAxis));
+  return {
+    steering: clamp(deltaX / magnitude),
+    throttle: clamp(deltaSecondAxis / magnitude),
+  };
+}
+
+function getPolicyState(policyTable, key, randomFn, guidance = { steering: 0, throttle: 0 }) {
+  if (!policyTable.has(key)) {
+    const random = typeof randomFn === 'function' ? randomFn : Math.random;
+    policyTable.set(key, {
+      steer: clamp(guidance.steering * 0.45 + (random() * 2 - 1) * 0.12),
+      throttle: clamp(guidance.throttle * 0.45 + (random() * 2 - 1) * 0.12),
+      value: 0,
+      visits: 0,
+    });
+  }
+  return policyTable.get(key);
+}
+
+function chooseControl(policyState, epsilon, randomFn) {
   const random = typeof randomFn === 'function' ? randomFn : Math.random;
-  if (random() < epsilon) {
-    return Math.floor(random() * ACTIONS.length);
+  const explore = random() < epsilon;
+
+  if (explore) {
+    return {
+      steering: clamp(random() * 2 - 1),
+      throttle: clamp(random() * 2 - 1),
+      explore,
+    };
   }
 
-  let bestIndex = 0;
-  for (let i = 1; i < values.length; i += 1) {
-    if (values[i] > values[bestIndex]) bestIndex = i;
-  }
-
-  return bestIndex;
+  return {
+    steering: clamp(policyState.steer + (random() * 2 - 1) * 0.06),
+    throttle: clamp(policyState.throttle + (random() * 2 - 1) * 0.06),
+    explore,
+  };
 }
 
 function distance2D(a, b, is2D) {
@@ -95,6 +115,36 @@ function obstacleClearance(objects, agentIndex, goalIndex, point, is2D) {
   return minClearance;
 }
 
+function radiusGuess(item, fallback = 0.75) {
+  if (Array.isArray(item?.scale)) {
+    return Math.max(item.scale[0] || 1, item.scale[1] || 1, item.scale[2] || 1) * 0.5;
+  }
+  return fallback;
+}
+
+function detectObstacleCollision(objects, agentIndex, goalIndex, point, is2D, agentRadius = 0.6) {
+  let collided = false;
+  let nearestClearance = Infinity;
+
+  objects.forEach((item, idx) => {
+    if (idx === agentIndex || idx === goalIndex) return;
+    if (!Array.isArray(item?.pos)) return;
+    if (item.type === 'light' || item.sensorMount) return;
+    if (item.agent) return;
+
+    const obstacleRadius = radiusGuess(item, 0.85);
+    const centerDist = distance2D(point, item.pos, is2D);
+    const clearance = centerDist - (obstacleRadius + agentRadius);
+    if (clearance < nearestClearance) nearestClearance = clearance;
+    if (clearance < -0.05) collided = true;
+  });
+
+  return {
+    collided,
+    clearance: Number.isFinite(nearestClearance) ? nearestClearance : null,
+  };
+}
+
 function createSeededRandom(seedValue) {
   let state = Number(seedValue);
   if (!Number.isFinite(state) || state <= 0) state = Date.now();
@@ -113,16 +163,18 @@ export function createTrainingEngine(model = 'ppo', options = {}) {
   const seededRandom = deterministic ? createSeededRandom(options.seed) : null;
 
   return {
-    qTable: new Map(),
+    policyTable: new Map(),
     epsilon: preset.epsilon,
     epsilonMin: preset.epsilonMin,
     epsilonDecay: preset.epsilonDecay,
     alpha: preset.alpha,
+    actorRate: Number((preset.alpha * 0.32).toFixed(4)),
     gamma: preset.gamma,
     stepSize: preset.stepSize,
     episode: 0,
     episodeReward: 0,
     episodeStep: 0,
+    totalSteps: 0,
     deterministic,
     seed: deterministic ? Number(options.seed) || null : null,
     random: deterministic ? seededRandom : Math.random,
@@ -143,34 +195,62 @@ export function runTrainingStep(objects, engine, options = {}) {
   const goal = objects[goalIndex];
   const is2D = Boolean(options.is2D || agent?.is2D || goal?.is2D);
   const currentState = stateKey(agent.pos, goal.pos, is2D);
-  const currentValues = getQValues(engine.qTable, currentState);
-  const action = chooseAction(currentValues, engine.epsilon, engine.random);
-  const movement = ACTIONS[action];
+  const guidance = directionSignal(agent.pos, goal.pos, is2D);
+  const currentPolicy = getPolicyState(engine.policyTable, currentState, engine.random, guidance);
+  currentPolicy.visits += 1;
+
+  const control = chooseControl(currentPolicy, engine.epsilon, engine.random);
+  const steering = Number(control.steering.toFixed(3));
+  const throttle = Number(control.throttle.toFixed(3));
+  const controlMagnitude = Math.max(0.1, Math.hypot(steering, throttle));
+  const stepMagnitude = engine.stepSize * (0.45 + Math.min(1, controlMagnitude) * 0.55);
 
   const prevDist = distance2D(agent.pos, goal.pos, is2D);
   const nextPos = is2D
     ? [
-        Number(bounded(agent.pos[0] + movement.dx * engine.stepSize).toFixed(2)),
-        Number(bounded(agent.pos[1] + movement.dy * engine.stepSize).toFixed(2)),
+        Number(bounded(agent.pos[0] + steering * stepMagnitude).toFixed(2)),
+        Number(bounded(agent.pos[1] + throttle * stepMagnitude).toFixed(2)),
         Number(agent.pos[2]),
       ]
     : [
-        Number(bounded(agent.pos[0] + movement.dx * engine.stepSize).toFixed(2)),
+        Number(bounded(agent.pos[0] + steering * stepMagnitude).toFixed(2)),
         agent.pos[1],
-        Number(bounded(agent.pos[2] + movement.dz * engine.stepSize).toFixed(2)),
+        Number(bounded(agent.pos[2] + throttle * stepMagnitude).toFixed(2)),
       ];
 
-  const nextDist = distance2D(nextPos, goal.pos, is2D);
+  const agentRadius = radiusGuess(agent, 0.6);
+  const collisionProbe = detectObstacleCollision(objects, agentIndex, goalIndex, nextPos, is2D, agentRadius);
+
+  let effectiveNextPos = nextPos;
+  let collided = collisionProbe.collided;
+  if (collided) {
+    const reboundScale = Math.max(0.12, stepMagnitude * 0.18);
+    effectiveNextPos = is2D
+      ? [
+          Number(bounded(agent.pos[0] - steering * reboundScale).toFixed(2)),
+          Number(bounded(agent.pos[1] - throttle * reboundScale).toFixed(2)),
+          Number(agent.pos[2]),
+        ]
+      : [
+          Number(bounded(agent.pos[0] - steering * reboundScale).toFixed(2)),
+          agent.pos[1],
+          Number(bounded(agent.pos[2] - throttle * reboundScale).toFixed(2)),
+        ];
+  }
+
+  const nextDist = distance2D(effectiveNextPos, goal.pos, is2D);
   let reward = (prevDist - nextDist) * 1.8 - 0.03;
   let reachedGoal = false;
   let nextGoalPos = goal.pos;
 
-  const nearestClearance = obstacleClearance(objects, agentIndex, goalIndex, nextPos, is2D);
+  const nearestClearance = collisionProbe.clearance ?? obstacleClearance(objects, agentIndex, goalIndex, effectiveNextPos, is2D);
   if (Number.isFinite(nearestClearance)) {
     if (nearestClearance < 0.35) reward -= 2.8;
     else if (nearestClearance < 1.0) reward -= 0.8;
     else if (nearestClearance > 2.0) reward += 0.08;
   }
+
+  if (collided) reward -= 6.5;
 
   if (nextDist < 1.2) {
     reward += 9;
@@ -178,15 +258,23 @@ export function runTrainingStep(objects, engine, options = {}) {
     nextGoalPos = randomGoal(is2D, goal.pos[2] ?? agent.pos[2] ?? 0.5, engine.random);
   }
 
-  const nextState = stateKey(nextPos, nextGoalPos, is2D);
-  const nextValues = getQValues(engine.qTable, nextState);
-  const bestNext = Math.max(...nextValues);
-  const currentQ = currentValues[action];
-  currentValues[action] = currentQ + engine.alpha * (reward + engine.gamma * bestNext - currentQ);
+  const nextState = stateKey(effectiveNextPos, nextGoalPos, is2D);
+  const nextGuidance = directionSignal(effectiveNextPos, nextGoalPos, is2D);
+  const nextPolicy = getPolicyState(engine.policyTable, nextState, engine.random, nextGuidance);
+
+  const tdTarget = reward + engine.gamma * nextPolicy.value;
+  const tdError = tdTarget - currentPolicy.value;
+  currentPolicy.value += engine.alpha * tdError;
+
+  const steeringError = guidance.steering - steering;
+  const throttleError = guidance.throttle - throttle;
+  currentPolicy.steer = clamp(currentPolicy.steer + engine.actorRate * tdError * steeringError);
+  currentPolicy.throttle = clamp(currentPolicy.throttle + engine.actorRate * tdError * throttleError);
 
   engine.epsilon = Math.max(engine.epsilonMin, engine.epsilon * engine.epsilonDecay);
   engine.episodeReward += reward;
   engine.episodeStep += 1;
+  engine.totalSteps += 1;
 
   let episodePoint = null;
   if (reachedGoal || engine.episodeStep >= 180) {
@@ -205,7 +293,19 @@ export function runTrainingStep(objects, engine, options = {}) {
 
   const updatedObjects = objects.map((item, idx) => {
     if (idx === agentIndex) {
-      return { ...item, pos: nextPos };
+      return {
+        ...item,
+        pos: effectiveNextPos,
+        trainingControl: {
+          action: control.explore ? 1 : 0,
+          steering,
+          throttle,
+          speed: Number(stepMagnitude.toFixed(3)),
+          confidence: Number((1 - engine.epsilon).toFixed(3)),
+          collided,
+          solved: reachedGoal,
+        },
+      };
     }
     if (idx === goalIndex && reachedGoal) {
       return { ...item, pos: nextGoalPos };
@@ -213,5 +313,19 @@ export function runTrainingStep(objects, engine, options = {}) {
     return item;
   });
 
-  return { objects: updatedObjects, episodePoint };
+  return {
+    objects: updatedObjects,
+    episodePoint,
+    stepMetrics: {
+      episode: engine.episode,
+      episodeStep: engine.episodeStep,
+      totalSteps: engine.totalSteps,
+      reward: Number(reward.toFixed(2)),
+      epsilon: Number(engine.epsilon.toFixed(3)),
+      distance: Number(nextDist.toFixed(2)),
+      clearance: Number.isFinite(nearestClearance) ? Number(nearestClearance.toFixed(2)) : null,
+      collided,
+      solved: reachedGoal,
+    },
+  };
 }

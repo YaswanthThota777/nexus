@@ -71,3 +71,19 @@ test('deterministic benchmark mode reproduces the same trajectory with identical
 
   assert.deepEqual(stateA[0].pos, stateB[0].pos);
 });
+
+test('training step emits policy control signals on agent', () => {
+  const engine = createTrainingEngine('ppo');
+  engine.epsilon = 0;
+
+  const objects = [
+    { id: 'agent', name: 'Agent', agent: true, pos: [0, 0.5, 0] },
+    { id: 'goal', name: 'Goal', type: 'sphere', color: '#ff3333', pos: [4, 0.5, 0] },
+  ];
+
+  const result = runTrainingStep(objects, engine, { is2D: false });
+  assert.ok(result.objects[0].trainingControl);
+  assert.equal(typeof result.objects[0].trainingControl.action, 'number');
+  assert.equal(typeof result.objects[0].trainingControl.steering, 'number');
+  assert.equal(typeof result.objects[0].trainingControl.throttle, 'number');
+});

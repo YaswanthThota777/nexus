@@ -501,6 +501,7 @@ function Editor({ workspace, onExit }) {
   
   const [isTraining, setIsTraining] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
+  const [viewMode, setViewMode] = useState('scene');
   const [savedEditState, setSavedEditState] = useState(null); 
   
   const [activeTabBottom, setActiveTabBottom] = useState('ml-agents');
@@ -522,6 +523,7 @@ function Editor({ workspace, onExit }) {
   const [runQueue, setRunQueue] = useState([]);
   const importInputRef = useRef(null);
   const trainerRef = useRef(null);
+  const objectsRef = useRef([]);
   const benchmarkSeedRef = useRef(424242);
   const [benchmarkMode, setBenchmarkMode] = useState(false);
   const [benchmarkTracker, setBenchmarkTracker] = useState(null);
@@ -557,6 +559,10 @@ function Editor({ workspace, onExit }) {
     : `nexus-ai-${workspace.template}`;
   const environmentStorageKey = `${workspaceStorageKey}-environment`;
   const queueSummary = getQueueSummary(runQueue);
+  const activeRun = useMemo(
+    () => runQueue.find((run) => run.status === 'running') || runQueue.find((run) => run.status === 'queued') || null,
+    [runQueue],
+  );
   const templateSpec = useMemo(
     () => workspace.templateSpec || {
       environment: workspace.config?.environment || workspace.template,
@@ -607,6 +613,10 @@ function Editor({ workspace, onExit }) {
       avgClearance,
     };
   }, [trainingData]);
+
+  useEffect(() => {
+    objectsRef.current = objects;
+  }, [objects]);
 
   useEffect(() => {
     setEnvironmentProfile(initialEnvironmentProfile);
@@ -864,8 +874,8 @@ function Editor({ workspace, onExit }) {
       windMps: environmentProfile.windMps,
     };
 
-    if (trainerRef.current?.qTable instanceof Map) {
-      payload.training.learnedQTable = Array.from(trainerRef.current.qTable.entries());
+    if (trainerRef.current?.policyTable instanceof Map) {
+      payload.training.learnedQTable = Array.from(trainerRef.current.policyTable.entries());
       payload.training.engine = {
         model: modelId,
         epsilon: trainerRef.current.epsilon,
@@ -913,8 +923,13 @@ function Editor({ workspace, onExit }) {
         if (Array.isArray(parsed.training?.learnedQTable)) {
           const engine = createTrainingEngine(parsed.training?.engine?.model || modelId);
           parsed.training.learnedQTable.forEach(([state, values]) => {
-            if (typeof state === 'string' && Array.isArray(values) && values.length === 4) {
-              engine.qTable.set(state, values.map((value) => Number(value) || 0));
+            if (typeof state === 'string' && values && typeof values === 'object') {
+              engine.policyTable.set(state, {
+                steer: Number(values.steer) || 0,
+                throttle: Number(values.throttle) || 0,
+                value: Number(values.value) || 0,
+                visits: Number(values.visits) || 0,
+              });
             }
           });
           engine.episode = Number(parsed.training?.engine?.episode) || engine.episode;
@@ -934,32 +949,55 @@ function Editor({ workspace, onExit }) {
   }, [triggerToast, modelId]);
 
   const enqueueModelRun = useCallback((objectCountOverride) => {
-    const compatibility = getModelCompatibility(templateSpec);
+    const sceneAgent = objects.find((item) => item?.agent);
+    const robotByAgentType = {
+      rover: 'rover',
+      drone: 'drone',
+      humanoid: 'humanoid',
+      robotic_arm: 'arm6dof',
+      quadruped: 'quadruped',
+      cube: 'amr',
+    };
+
+    const inferredRobot = (() => {
+      const fromTemplate = templateSpec.robot;
+      if (fromTemplate && fromTemplate !== 'generic-agent') return fromTemplate;
+      if (sceneAgent?.type && robotByAgentType[sceneAgent.type]) return robotByAgentType[sceneAgent.type];
+      return workspace.is2D ? 'amr' : 'rover';
+    })();
+
+    const compatibility = getModelCompatibility({
+      ...templateSpec,
+      model: modelId,
+      robot: inferredRobot,
+    });
     if (!compatibility.compatible) {
       triggerToast(compatibility.reason, 'info');
       return false;
     }
 
     const item = createRunQueueItem({
-      model: templateSpec.model || 'ppo',
+      model: modelId,
       environment: templateSpec.environment || workspace.template,
-      robot: templateSpec.robot || 'generic-agent',
+      robot: inferredRobot,
       objectCount: objectCountOverride ?? objects.length,
     });
     setRunQueue((prev) => [item, ...prev]);
     setActiveTabBottom('runs');
     triggerToast(`Queued ${item.config.model.toUpperCase()} training run`, 'info');
     return true;
-  }, [workspace, objects.length, triggerToast, templateSpec]);
+  }, [workspace, objects, triggerToast, templateSpec, modelId]);
 
   const togglePlayMode = useCallback((startObjects = objects) => {
     const safeStartObjects = Array.isArray(startObjects) ? startObjects : objects;
     if (!isPlaying) {
       setSavedEditState(JSON.parse(JSON.stringify(safeStartObjects)));
       setIsPlaying(true);
+      setViewMode('game');
       triggerToast("Physics Engine Active", "info");
     } else {
       setIsPlaying(false);
+      setViewMode('scene');
       setIsTraining(false);
       trainerRef.current = null;
       if (savedEditState) setObjects(savedEditState);
@@ -1150,12 +1188,13 @@ function Editor({ workspace, onExit }) {
       }
 
       interval = setInterval(() => {
-        let stepResult = null;
+        const currentObjects = objectsRef.current;
+        const stepResult = runTrainingStep(currentObjects, trainerRef.current, { is2D: workspace.is2D });
 
-        setObjects((prev) => {
-          stepResult = runTrainingStep(prev, trainerRef.current, { is2D: workspace.is2D });
-          return stepResult.objects;
-        });
+        if (stepResult?.objects) {
+          objectsRef.current = stepResult.objects;
+          setObjects(stepResult.objects);
+        }
 
         if (stepResult?.missingTargets) {
           const prepared = ensureTrainingSceneReady();
@@ -1166,6 +1205,44 @@ function Editor({ workspace, onExit }) {
           setIsTraining(false);
           triggerToast('Training needs one agent and one goal object in scene.', 'info');
           return;
+        }
+
+        if (stepResult?.stepMetrics) {
+          const step = stepResult.stepMetrics;
+          setTrainingEpoch(step.episode);
+          setLatestEpisodeMetrics((prev) => ({ ...prev, ...step }));
+          setCurrentEpsilon(step.epsilon);
+
+          setRunQueue((prev) => {
+            if (prev.length === 0) return prev;
+
+            let runningFound = false;
+            return prev.map((run) => {
+              if (!runningFound && run.status === 'queued') {
+                runningFound = true;
+                return {
+                  ...run,
+                  status: 'running',
+                  startedAt: run.startedAt || Date.now(),
+                  progress: Math.max(run.progress, 2),
+                };
+              }
+
+              if (run.status === 'running') {
+                runningFound = true;
+                const progressFromSteps = Math.min(98, step.totalSteps / 6.5);
+                const progressFromDistance = Math.max(0, Math.min(98, (40 - step.distance) * 2));
+                const progress = Math.max(run.progress, Number(Math.max(progressFromSteps, progressFromDistance).toFixed(1)));
+
+                return {
+                  ...run,
+                  progress,
+                };
+              }
+
+              return run;
+            });
+          });
         }
 
         if (stepResult?.episodePoint) {
@@ -1965,8 +2042,25 @@ function Editor({ workspace, onExit }) {
                 setBenchmarkTracker(null);
               }
 
+              setRunQueue((prev) => {
+                let promoted = false;
+                return prev.map((run) => {
+                  if (!promoted && run.status === 'queued') {
+                    promoted = true;
+                    return {
+                      ...run,
+                      status: 'running',
+                      startedAt: run.startedAt || Date.now(),
+                      progress: Math.max(run.progress, 2),
+                    };
+                  }
+                  return run;
+                });
+              });
+
               setIsTraining(true);
-              setActiveTabBottom('ml-agents');
+              setActiveTabBottom('runs');
+              triggerToast('Training started. Live run details opened in Run Queue.', 'success');
             }}
             className={`px-4 py-1 rounded-sm font-extrabold text-[11px] flex items-center space-x-2 transition-all duration-300 shadow-inner border uppercase tracking-wide ${
               isTraining ? 'bg-[#3a72b8] text-white border-[#2b5f9f] shadow-[0_0_16px_rgba(58,114,184,0.45)]' : 'bg-[#2b3442] text-[#9fc3f0] border-[#3a72b8] hover:bg-[#344a64]'
@@ -2045,8 +2139,22 @@ function Editor({ workspace, onExit }) {
                     <ChevronsRight size={16} />
                  </button>
               )}
-              <button type="button" aria-label="Switch to Scene view" className={`px-4 py-1 text-[11px] font-extrabold rounded-sm transition-all uppercase tracking-wide ${!isPlaying ? 'bg-[#3a72b8] text-white shadow-inner' : 'text-gray-400 hover:text-gray-200'}`} onClick={() => isPlaying && togglePlayMode()}>Scene</button>
-              <button type="button" aria-label="Switch to Game view" className={`px-4 py-1 text-[11px] font-extrabold rounded-sm transition-all uppercase tracking-wide ${isPlaying ? 'bg-[#3a72b8] text-white shadow-inner' : 'text-gray-400 hover:text-gray-200'}`} onClick={() => !isPlaying && togglePlayMode()}>Game</button>
+              <button
+                type="button"
+                aria-label="Switch to Scene view"
+                className={`px-4 py-1 text-[11px] font-extrabold rounded-sm transition-all uppercase tracking-wide ${viewMode === 'scene' ? 'bg-[#3a72b8] text-white shadow-inner' : 'text-gray-400 hover:text-gray-200'}`}
+                onClick={() => setViewMode('scene')}
+              >
+                Scene
+              </button>
+              <button
+                type="button"
+                aria-label="Switch to Game view"
+                className={`px-4 py-1 text-[11px] font-extrabold rounded-sm transition-all uppercase tracking-wide ${viewMode === 'game' ? 'bg-[#3a72b8] text-white shadow-inner' : 'text-gray-400 hover:text-gray-200'}`}
+                onClick={() => setViewMode('game')}
+              >
+                Game
+              </button>
               
               <div className="flex-1"></div>
               
@@ -2111,7 +2219,8 @@ function Editor({ workspace, onExit }) {
                      <div className="text-gray-400 flex justify-between w-56"><span>Engine:</span> <span className="text-green-400 font-bold">PhysX / RL</span></div>
                      <div className="text-gray-400 flex justify-between w-56"><span>Model Strategy:</span> <span className="text-[#9fc3f0] font-bold">{modelProfile.strategy}</span></div>
                      <div className="text-gray-400 flex justify-between w-56"><span>Epoch:</span> <span className="text-white font-bold">{trainingEpoch}</span></div>
-                     <div className="text-gray-400 flex justify-between w-56"><span>Env Steps:</span> <span className="text-white font-bold">{(trainingEpoch * 512).toLocaleString()}</span></div>
+                     <div className="text-gray-400 flex justify-between w-56"><span>Episode Step:</span> <span className="text-white font-bold">{Number(latestEpisodeMetrics?.episodeStep || 0)} / 180</span></div>
+                     <div className="text-gray-400 flex justify-between w-56"><span>Env Steps:</span> <span className="text-white font-bold">{Number(latestEpisodeMetrics?.totalSteps || 0).toLocaleString()}</span></div>
                      <div className="text-gray-400 flex justify-between w-56"><span>Last Reward:</span> <span className="text-[#9fc3f0] font-bold">{Number(latestEpisodeMetrics?.reward || 0).toFixed(2)}</span></div>
                      <div className="text-gray-400 flex justify-between w-56"><span>Avg Reward (25):</span> <span className="text-[#9fc3f0] font-bold">{trainingInsights.avgReward.toFixed(2)}</span></div>
                      <div className="text-gray-400 flex justify-between w-56"><span>Solved Rate (25):</span> <span className="text-green-400 font-bold">{trainingInsights.solvedRate.toFixed(1)}%</span></div>
@@ -2406,6 +2515,20 @@ function Editor({ workspace, onExit }) {
                       Total {queueSummary.total} · Running {queueSummary.running} · Queued {queueSummary.queued}
                     </div>
                   </div>
+
+                  {activeRun && (
+                    <div className="mb-3 border border-[#355278] bg-[#111826] rounded-lg p-3">
+                      <div className="text-[10px] text-[#9fc3f0] font-black uppercase tracking-wider mb-2">Active Run Details</div>
+                      <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-[11px]">
+                        <div className="text-gray-400">Model <span className="text-white font-bold ml-1">{activeRun.config.model.toUpperCase()}</span></div>
+                        <div className="text-gray-400">Robot <span className="text-white font-bold ml-1">{activeRun.config.robot}</span></div>
+                        <div className="text-gray-400">Status <span className="text-[#9fc3f0] font-bold ml-1 uppercase">{activeRun.status}</span></div>
+                        <div className="text-gray-400">Progress <span className="text-white font-bold ml-1">{activeRun.progress.toFixed(1)}%</span></div>
+                        <div className="text-gray-400">Episode <span className="text-white font-bold ml-1">{trainingEpoch}</span></div>
+                        <div className="text-gray-400">Reward <span className="text-white font-bold ml-1">{Number(latestEpisodeMetrics?.reward || 0).toFixed(2)}</span></div>
+                      </div>
+                    </div>
+                  )}
 
                   <div className="space-y-3 overflow-y-auto pr-2">
                     {runQueue.length === 0 && (
@@ -2821,6 +2944,7 @@ function ThreeJsView({ objects, isPlaying, isTraining, selectedId, transformMode
   const rendererRef = useRef(null);
   const mainCameraRef = useRef(null);
   const pipCameraRef = useRef(null);
+  const trainingMotionRef = useRef({});
   const [sceneVersion, setSceneVersion] = useState(0);
 
   useEffect(() => {
@@ -3066,9 +3190,6 @@ function ThreeJsView({ objects, isPlaying, isTraining, selectedId, transformMode
               if (trainingPulseActive) {
                 mat.emissive.set('#3a72b8');
                 mat.emissiveIntensity = pulseIntensity;
-              } else {
-                mat.emissive.setHex(0x000000);
-                mat.emissiveIntensity = 0;
               }
             };
 
@@ -3083,8 +3204,82 @@ function ThreeJsView({ objects, isPlaying, isTraining, selectedId, transformMode
                 const body = bodiesRef.current[id];
                 const mesh = meshesRef.current[id];
                 if (body && mesh) {
-                    mesh.position.copy(body.position);
-                    mesh.quaternion.copy(body.quaternion);
+                    if (mesh.userData.trainingDynamics) {
+                      const target = new THREE.Vector3(body.position.x, body.position.y, body.position.z);
+                      mesh.position.lerp(target, 0.24);
+
+                      const previous = trainingMotionRef.current[id] || {
+                        lastTarget: target.clone(),
+                        speed: 0,
+                        actuatorPhase: 0,
+                      };
+
+                      const delta = target.clone().sub(previous.lastTarget);
+                      const speed = delta.length();
+
+                      if (speed > 0.0008) {
+                        const headingQuat = new THREE.Quaternion();
+                        if (is2D) {
+                          const angleZ = Math.atan2(delta.y, delta.x);
+                          headingQuat.setFromEuler(new THREE.Euler(0, 0, angleZ));
+                        } else {
+                          const yaw = Math.atan2(delta.x, delta.z);
+                          headingQuat.setFromEuler(new THREE.Euler(0, yaw, 0));
+                        }
+                        mesh.quaternion.slerp(headingQuat, 0.16);
+                      }
+
+                      const movementSpeed = speed > 0.0008 ? speed : previous.speed * 0.92;
+                      const control = mesh.userData.trainingControl || {};
+                      const steering = Number(control.steering || 0);
+                      const throttle = Number(control.throttle || 0);
+                      const throttleMagnitude = Math.max(0, Math.min(1, Math.abs(throttle) + Math.abs(steering) * 0.4));
+                      const actuatorPhase = (previous.actuatorPhase || 0) + (0.08 + throttleMagnitude * 0.32);
+
+                      if (Math.abs(steering) > 0.001 && !is2D) {
+                        const steerQuat = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, steering * 0.06, 0));
+                        mesh.quaternion.slerp(steerQuat.multiply(mesh.quaternion.clone()), 0.08);
+                      }
+
+                      mesh.traverse((child) => {
+                        if (!child) return;
+
+                        if (typeof child.name === 'string' && child.name.startsWith('wheel-')) {
+                          child.rotation.x -= Math.max(0.01, (movementSpeed * 8) + throttleMagnitude * 0.45);
+                        }
+
+                        if (typeof child.name === 'string' && child.name.startsWith('rotor-')) {
+                          child.rotation.y += 0.35 + throttleMagnitude * 1.4;
+                        }
+
+                        if (typeof child.name === 'string' && (child.name === 'left-leg' || child.name === 'right-leg')) {
+                          const dir = child.name === 'left-leg' ? 1 : -1;
+                          child.rotation.x = Math.sin(actuatorPhase) * Math.min(0.35, throttleMagnitude * 0.42) * dir;
+                        }
+
+                        if (typeof child.name === 'string' && child.name.startsWith('quad-leg-')) {
+                          const legIdx = Number(child.name.split('-')[2] || 0);
+                          const phase = legIdx % 2 === 0 ? 0 : Math.PI;
+                          child.rotation.x = Math.sin(actuatorPhase + phase) * Math.min(0.28, throttleMagnitude * 0.36);
+                        }
+
+                        if (child.name === 'arm-seg1') {
+                          child.rotation.z = steering * 0.28;
+                        }
+                        if (child.name === 'arm-seg2') {
+                          child.rotation.x = -throttle * 0.22;
+                        }
+                      });
+
+                      trainingMotionRef.current[id] = {
+                        lastTarget: target,
+                        speed: movementSpeed,
+                        actuatorPhase,
+                      };
+                    } else {
+                      mesh.position.copy(body.position);
+                      mesh.quaternion.copy(body.quaternion);
+                    }
                 }
             });
         }
@@ -3282,22 +3477,31 @@ function ThreeJsView({ objects, isPlaying, isTraining, selectedId, transformMode
                  const segment1 = new THREE.Mesh(new THREE.CylinderGeometry(0.2, 0.2, 1.5, 16), armMat); segment1.position.y = 1.15;
                  const joint2 = new THREE.Mesh(new THREE.SphereGeometry(0.3, 32, 32), baseMat); joint2.position.y = 1.9;
                  const segment2 = new THREE.Mesh(new THREE.CylinderGeometry(0.15, 0.15, 1.2, 16), armMat); segment2.position.set(0, 2.5, 0.3); segment2.rotation.x = Math.PI / 6;
+                 segment1.name = 'arm-seg1';
+                 segment2.name = 'arm-seg2';
                  mesh.add(base, joint1, segment1, joint2, segment2);
                } else if (obj.type === 'drone') {
                  const armMat = new THREE.MeshStandardMaterial({ color: '#555' });
                  mesh.add(new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.2, 0.4), material));
                  mesh.add(new THREE.Mesh(new THREE.BoxGeometry(1.2, 0.05, 0.05), armMat));
                  mesh.add(new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.05, 1.2), armMat));
+                 [[0.55, 0.14, 0.55], [-0.55, 0.14, 0.55], [0.55, 0.14, -0.55], [-0.55, 0.14, -0.55]].forEach((pos, idx) => {
+                   const rotor = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.16, 0.02, 18), new THREE.MeshStandardMaterial({ color: '#a7b7c8', metalness: 0.72, roughness: 0.22 }));
+                   rotor.position.set(pos[0], pos[1], pos[2]);
+                   rotor.name = `rotor-${idx}`;
+                   mesh.add(rotor);
+                 });
                } else if (obj.type === 'rover') {
                  const bodyMat = new THREE.MeshStandardMaterial({ color: obj.color || '#8899a6', metalness: 0.24, roughness: 0.58 });
                  const wheelMat = new THREE.MeshStandardMaterial({ color: '#1f2933', metalness: 0.15, roughness: 0.72 });
                  const chassis = new THREE.Mesh(new THREE.BoxGeometry(1.8, 0.55, 2.5), bodyMat);
                  chassis.position.y = 0.45;
                  mesh.add(chassis);
-                 [[-0.92, 0.22, 0.95], [0.92, 0.22, 0.95], [-0.92, 0.22, -0.95], [0.92, 0.22, -0.95]].forEach((position) => {
+                 [[-0.92, 0.22, 0.95], [0.92, 0.22, 0.95], [-0.92, 0.22, -0.95], [0.92, 0.22, -0.95]].forEach((position, idx) => {
                    const wheel = new THREE.Mesh(new THREE.CylinderGeometry(0.3, 0.3, 0.22, 20), wheelMat);
                    wheel.rotation.z = Math.PI / 2;
                    wheel.position.set(position[0], position[1], position[2]);
+                   wheel.name = `wheel-${idx}`;
                    mesh.add(wheel);
                  });
                } else if (obj.type === 'humanoid') {
@@ -3309,17 +3513,20 @@ function ThreeJsView({ objects, isPlaying, isTraining, selectedId, transformMode
                  head.position.y = 1.82;
                  const leftLeg = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.85, 0.22), suitMat);
                  leftLeg.position.set(-0.18, 0.42, 0);
+                 leftLeg.name = 'left-leg';
                  const rightLeg = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.85, 0.22), suitMat);
                  rightLeg.position.set(0.18, 0.42, 0);
+                 rightLeg.name = 'right-leg';
                  mesh.add(torso, head, leftLeg, rightLeg);
                } else if (obj.type === 'quadruped') {
                  const bodyMat = new THREE.MeshStandardMaterial({ color: obj.color || '#f39c12', metalness: 0.18, roughness: 0.56 });
                  const body = new THREE.Mesh(new THREE.BoxGeometry(1.45, 0.5, 2.35), bodyMat);
                  body.position.y = 0.9;
                  mesh.add(body);
-                 [[-0.5, 0.3, 0.88], [0.5, 0.3, 0.88], [-0.5, 0.3, -0.88], [0.5, 0.3, -0.88]].forEach((position) => {
+                 [[-0.5, 0.3, 0.88], [0.5, 0.3, 0.88], [-0.5, 0.3, -0.88], [0.5, 0.3, -0.88]].forEach((position, idx) => {
                    const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.12, 0.9, 16), bodyMat);
                    leg.position.set(position[0], position[1], position[2]);
+                   leg.name = `quad-leg-${idx}`;
                    mesh.add(leg);
                  });
                } else {
@@ -3351,6 +3558,8 @@ function ThreeJsView({ objects, isPlaying, isTraining, selectedId, transformMode
       const mesh = meshesRef.current[obj.id];
       if (!mesh) return;
       mesh.userData.trainingPulse = Boolean(isTraining && obj.agent);
+      mesh.userData.trainingDynamics = Boolean(isTraining && obj.agent);
+      mesh.userData.trainingControl = obj.trainingControl || null;
 
       if (obj.type === 'light') {
          mesh.position.set(obj.pos[0], obj.pos[1], obj.pos[2]);
@@ -3417,6 +3626,7 @@ function ThreeJsView({ objects, isPlaying, isTraining, selectedId, transformMode
         const mesh = meshesRef.current[id];
         if (mesh.parent) mesh.parent.remove(mesh);
         delete meshesRef.current[id];
+        delete trainingMotionRef.current[id];
         if (bodiesRef.current[id] && worldRef.current) {
             worldRef.current.removeBody(bodiesRef.current[id]);
             delete bodiesRef.current[id];
