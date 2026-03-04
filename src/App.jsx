@@ -1743,6 +1743,11 @@ function Editor({ workspace, onExit }) {
                        obj.type === 'empty' ? <Box size={14} className="mr-2 text-gray-600 border border-dashed border-gray-500 rounded-sm" /> :
                        <Box size={14} className="mr-2 text-gray-400" />}
                       <span className="truncate">{obj.name}</span>
+                      {isTraining && obj.agent && (
+                        <span className="ml-2 text-[9px] px-1.5 py-0.5 rounded bg-[#3a72b822] text-[#9fc3f0] border border-[#3a72b855] font-black tracking-wider uppercase animate-pulse">
+                          Training
+                        </span>
+                      )}
                   </div>
                   {hasChildren && isExpanded && renderHierarchyTree(obj.id, depth + 1)}
               </React.Fragment>
@@ -3050,6 +3055,28 @@ function ThreeJsView({ objects, isPlaying, isTraining, selectedId, transformMode
             scene.userData.selectionBox.visible = false;
         }
 
+        const pulseIntensity = 0.25 + ((Math.sin(Date.now() / 140) + 1) * 0.3);
+        Object.values(meshesRef.current).forEach((mesh) => {
+          const trainingPulseActive = Boolean(mesh?.userData?.trainingPulse);
+          mesh.traverse((child) => {
+            if (!child?.isMesh || !child.material) return;
+
+            const applyPulse = (mat) => {
+              if (!mat?.emissive) return;
+              if (trainingPulseActive) {
+                mat.emissive.set('#3a72b8');
+                mat.emissiveIntensity = pulseIntensity;
+              } else {
+                mat.emissive.setHex(0x000000);
+                mat.emissiveIntensity = 0;
+              }
+            };
+
+            if (Array.isArray(child.material)) child.material.forEach(applyPulse);
+            else applyPulse(child.material);
+          });
+        });
+
         if (worldRef.current) {
             worldRef.current.step(1/60);
             Object.keys(bodiesRef.current).forEach(id => {
@@ -3323,6 +3350,7 @@ function ThreeJsView({ objects, isPlaying, isTraining, selectedId, transformMode
     objects.forEach(obj => {
       const mesh = meshesRef.current[obj.id];
       if (!mesh) return;
+      mesh.userData.trainingPulse = Boolean(isTraining && obj.agent);
 
       if (obj.type === 'light') {
          mesh.position.set(obj.pos[0], obj.pos[1], obj.pos[2]);
