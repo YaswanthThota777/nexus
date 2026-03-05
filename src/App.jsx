@@ -1,32 +1,79 @@
-import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { 
-  Play, Pause, Square, Settings, Box, Circle, LayoutTemplate, 
-  Folder, File, ChevronRight, ChevronDown, Plus, MoreVertical, 
-  Activity, Zap, Crosshair, Move, RotateCcw, Maximize, BrainCircuit,
-  Cpu, Rocket, Plane, Bug, Save, Trash2, RefreshCw, Upload, Download,
-  Video, Layers, ShieldCheck, TerminalSquare, X, Grid, Image as ImageIcon,
-  BookOpen, Users, HardDrive, Link, Keyboard, CheckCircle, Info,
-  MousePointer2, PlusCircle, Copy, Trash, FolderPlus, Wind, Droplets,
-  Home, Mountain, Car, Bug as SpiderIcon, Waves,
-  ChevronsLeft, ChevronsRight, ChevronsDown, ChevronsUp
-} from 'lucide-react';
-import { createProjectExportPayload, validateProjectImportPayload } from './lib/projectSchema';
-import { createRunQueueItem, getQueueSummary } from './lib/runQueue';
-import { createTrainingEngine, runTrainingStep } from './lib/realTrainingEngine';
 import {
-  HERO_TEMPLATE_PRESETS,
-  createDefaultTemplateSpec,
-  compileTemplateToScene,
-  getModelCompatibility,
-  getModelProfile,
-  normalizeSceneForEditor,
-} from './lib/templateEngine';
-import { createBenchmarkTracker, updateBenchmarkTracker, summarizeBenchmark } from './lib/trainingBenchmark';
-import { evaluateSimReadiness, runReadinessScenarioSuite } from './lib/simReadiness';
-import { buildLaunchEvidencePack } from './lib/launchEvidencePack';
-import { apiClient } from './lib/apiClient';
-import UniversalTemplateBuilder from './components/UniversalTemplateBuilder';
+    Activity,
+    BookOpen,
+    Box,
+    BrainCircuit,
+    Car,
+    CheckCircle,
+    ChevronDown,
+    ChevronRight,
+    ChevronsDown,
+    ChevronsLeft, ChevronsRight,
+    ChevronsUp,
+    Circle,
+    Copy,
+    Cpu,
+    Crosshair,
+    Download,
+    Droplets,
+    Folder,
+    FolderPlus,
+    Grid,
+    HardDrive,
+    Home,
+    Image as ImageIcon,
+    Info,
+    Keyboard,
+    Layers,
+    LayoutTemplate,
+    Link,
+    Maximize,
+    Mountain,
+    MousePointer2,
+    Move,
+    Plane,
+    Play,
+    Plus,
+    PlusCircle,
+    RefreshCw,
+    Rocket,
+    RotateCcw,
+    Settings,
+    ShieldCheck,
+    Bug as SpiderIcon,
+    Square,
+    TerminalSquare,
+    Trash,
+    Trash2,
+    Upload,
+    Users,
+    Video,
+    Waves,
+    Wind,
+    X,
+    Zap
+} from 'lucide-react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { BrowserRouter, Route, Routes, useNavigate } from 'react-router-dom';
+import ModelViewBar from './components/ModelViewBar';
 import TemplateMarketplaceModal from './components/TemplateMarketplaceModal';
+import UniversalTemplateBuilder from './components/UniversalTemplateBuilder';
+import { apiClient } from './lib/apiClient';
+import { buildLaunchEvidencePack } from './lib/launchEvidencePack';
+import { saveModel } from './lib/modelStorage';
+import { createProjectExportPayload, validateProjectImportPayload } from './lib/projectSchema';
+import { createTrainingEngine, runTrainingStep } from './lib/realTrainingEngine';
+import { createRunQueueItem, getQueueSummary } from './lib/runQueue';
+import { evaluateSimReadiness, runReadinessScenarioSuite } from './lib/simReadiness';
+import {
+    HERO_TEMPLATE_PRESETS,
+    compileTemplateToScene,
+    createDefaultTemplateSpec,
+    getModelCompatibility,
+    getModelProfile,
+    normalizeSceneForEditor,
+} from './lib/templateEngine';
+import { createBenchmarkTracker, summarizeBenchmark, updateBenchmarkTracker } from './lib/trainingBenchmark';
 
 const TRAINING_STEP_INTERVAL_MS = 50;
 
@@ -42,25 +89,84 @@ const globalStyles = `
 `;
 
 
-export default function UnityAIStudio() {
-  const [appState, setAppState] = useState('hub');
+function UnityAIStudio({ initialAppState = 'hub', onEnterEditor, onExitHub }) {
+  const [appState, setAppState] = useState(initialAppState);
   const [project, setProject] = useState(null);
+
+  useEffect(() => {
+    setAppState(initialAppState);
+  }, [initialAppState]);
+
+  useEffect(() => {
+    if (initialAppState === 'editor' && !project) {
+      setProject({
+        name: 'Untitled Project',
+        template: 'custom',
+        projectId: `route-editor-${Date.now()}`,
+        templateSpec: createDefaultTemplateSpec(),
+        config: {},
+      });
+    }
+  }, [initialAppState, project]);
 
   if (appState === 'hub') {
     return (
       <>
         <style>{globalStyles}</style>
-        <ProjectHub onLaunch={(proj) => { setProject(proj); setAppState('editor'); }} />
+        <ProjectHub onLaunch={(proj) => {
+          setProject(proj);
+          setAppState('editor');
+          if (typeof onEnterEditor === 'function') onEnterEditor();
+        }} />
       </>
     );
   }
   return (
     <>
       <style>{globalStyles}</style>
-      <Editor workspace={project} onExit={() => setAppState('hub')} />
+      <Editor workspace={project} onExit={() => {
+        setAppState('hub');
+        if (typeof onExitHub === 'function') onExitHub();
+      }} />
     </>
   );
 }
+
+function RootRouteWrapper() {
+  const navigate = useNavigate();
+  return (
+    <UnityAIStudio
+      initialAppState="hub"
+      onEnterEditor={() => navigate('/editor')}
+      onExitHub={() => navigate('/')}
+    />
+  );
+}
+
+function EditorRouteWrapper() {
+  const navigate = useNavigate();
+  return (
+    <UnityAIStudio
+      initialAppState="editor"
+      onEnterEditor={() => navigate('/editor')}
+      onExitHub={() => navigate('/')}
+    />
+  );
+}
+
+function App() {
+  return (
+    <BrowserRouter>
+      <Routes>
+        <Route path="/" element={<RootRouteWrapper />} />
+        <Route path="/editor" element={<EditorRouteWrapper />} />
+      </Routes>
+    </BrowserRouter>
+  );
+}
+
+export { UnityAIStudio };
+export default App;
 
 // --- PROJECT HUB ---
 function ProjectHub({ onLaunch }) {
@@ -495,6 +601,20 @@ function SidebarButton({ icon, label, active, onClick }) {
 
 // --- EDITOR COMPONENT ---
 function Editor({ workspace, onExit }) {
+  if (!workspace) {
+    return (
+      <div className="min-h-screen bg-black text-white flex flex-col items-center justify-center gap-4">
+        <div className="text-lg font-semibold">No project loaded for editor.</div>
+        <button
+          className="px-4 py-2 rounded-md bg-[#00ffcc] text-black font-bold hover:bg-[#00d6ad]"
+          onClick={onExit}
+        >
+          Return to Hub
+        </button>
+      </div>
+    );
+  }
+
   const [objects, setObjects] = useState([]);
   const [selectedId, setSelectedId] = useState(null);
   const [expandedNodes, setExpandedNodes] = useState(new Set()); 
@@ -525,6 +645,7 @@ function Editor({ workspace, onExit }) {
   const trainerRef = useRef(null);
   const objectsRef = useRef([]);
   const benchmarkSeedRef = useRef(424242);
+  const wasTrainingRef = useRef(false);
   const [benchmarkMode, setBenchmarkMode] = useState(false);
   const [benchmarkTracker, setBenchmarkTracker] = useState(null);
   const [latestEpisodeMetrics, setLatestEpisodeMetrics] = useState(null);
@@ -733,6 +854,33 @@ function Editor({ workspace, onExit }) {
     setToasts(prev => [...prev, { id, msg, type }]);
     setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), 3500);
   }, []);
+
+  const persistModelSnapshot = useCallback(() => {
+    const projectId = workspace?.projectId || workspace?.id;
+    if (!projectId || !trainerRef.current) return null;
+    try {
+      const saved = saveModel(projectId, trainerRef.current, {
+        reward: Number(latestEpisodeMetrics?.reward ?? trainingInsights.avgReward ?? 0),
+        successRate: Number(latestEpisodeMetrics?.successRate ?? 0),
+      });
+      if (saved) triggerToast('Model saved before halting.', 'success');
+      return saved;
+    } catch (error) {
+      console.error(error);
+      triggerToast('Failed to save model snapshot.', 'info');
+      return null;
+    }
+  }, [workspace, latestEpisodeMetrics, trainingInsights.avgReward, triggerToast]);
+
+  useEffect(() => {
+    if (wasTrainingRef.current && !isTraining && trainerRef.current) {
+      const saved = persistModelSnapshot();
+      if (saved) {
+        trainerRef.current = null;
+      }
+    }
+    wasTrainingRef.current = isTraining;
+  }, [isTraining, persistModelSnapshot]);
 
   // --- TEMPLATE GENERATION LOGIC ---
   useEffect(() => {
@@ -996,6 +1144,9 @@ function Editor({ workspace, onExit }) {
       setViewMode('game');
       triggerToast("Physics Engine Active", "info");
     } else {
+      if (isTraining && trainerRef.current) {
+        persistModelSnapshot();
+      }
       setIsPlaying(false);
       setViewMode('scene');
       setIsTraining(false);
@@ -1004,7 +1155,7 @@ function Editor({ workspace, onExit }) {
       setBenchmarkTracker(null);
       triggerToast("Simulation Reset", "info");
     }
-  }, [isPlaying, objects, savedEditState, triggerToast]);
+  }, [isPlaying, objects, savedEditState, triggerToast, isTraining, persistModelSnapshot]);
 
   const ensureTrainingSceneReady = useCallback(() => {
     const hasAgent = objects.some((item) => item?.agent && Array.isArray(item?.pos));
@@ -2001,6 +2152,8 @@ function Editor({ workspace, onExit }) {
           <button
             onClick={() => {
               if (isTraining) {
+                persistModelSnapshot();
+                trainerRef.current = null;
                 setIsTraining(false);
                 setActiveTabBottom('ml-agents');
                 triggerToast('Training paused.', 'info');
@@ -2240,6 +2393,14 @@ function Editor({ workspace, onExit }) {
               <div className="h-9 bg-[#303031] flex items-center px-3 border-b border-[#1f1f1f] font-semibold text-[11px] text-gray-300 tracking-wide uppercase select-none">
                 <ChevronsRight size={16} className="mr-3 text-gray-500 hover:text-white cursor-pointer transition-colors" title="Collapse Panel" onClick={(e) => { e.stopPropagation(); setRightCollapsed(true); }} />
                 Inspector {isPlaying && <span className="ml-3 px-2 py-0.5 bg-red-900/30 text-red-400 border border-red-800 rounded-sm text-[9px] font-black">LOCKED IN PLAY MODE</span>}
+              </div>
+
+              <div className="p-4 border-b border-[#1f1f1f] bg-[#1a1a1a]">
+                <ModelViewBar
+                  project={workspace}
+                  engineRef={trainerRef}
+                  onLoaded={() => triggerToast('Model loaded from storage.', 'success')}
+                />
               </div>
 
               {selectedObject ? (
