@@ -1,62 +1,52 @@
 import {
-    Activity,
-    BookOpen,
-    Box,
-    BrainCircuit,
-    Car,
-    CheckCircle,
-    ChevronDown,
-    ChevronRight,
-    ChevronsDown,
-    ChevronsLeft, ChevronsRight,
-    ChevronsUp,
-    Circle,
-    Copy,
-    Cpu,
-    Crosshair,
-    Download,
-    Droplets,
-    Folder,
-    FolderPlus,
-    Grid,
-    HardDrive,
-    Home,
-    Image as ImageIcon,
-    Info,
-    Keyboard,
-    Layers,
-    LayoutTemplate,
-    Link,
-    Maximize,
-    Mountain,
-    MousePointer2,
-    Move,
-    Plane,
-    Play,
-    Plus,
-    PlusCircle,
-    RefreshCw,
-    Rocket,
-    RotateCcw,
-    Settings,
-    ShieldCheck,
-    Bug as SpiderIcon,
-    Square,
-    TerminalSquare,
-    Trash,
-    Trash2,
-    Upload,
-    Users,
-    Video,
-    Waves,
-    Wind,
-    X,
-    Zap
+  Activity,
+  BookOpen,
+  Box,
+  Car,
+  CheckCircle,
+  ChevronRight,
+  ChevronsDown,
+  ChevronsRight,
+  Circle,
+  Copy,
+  Cpu,
+  Crosshair,
+  Download,
+  Folder,
+  FolderPlus,
+  Grid,
+  HardDrive,
+  Home,
+  Info,
+  Keyboard,
+  Layers,
+  LayoutTemplate,
+  Link,
+  Mountain,
+  Plane,
+  Play,
+  PlusCircle,
+  Rocket,
+  ShieldCheck,
+  Bug as SpiderIcon,
+  Square,
+  TerminalSquare,
+  Trash,
+  Trash2,
+  Upload,
+  Users,
+  Waves,
+  X,
+  Zap
 } from 'lucide-react';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { BrowserRouter, Route, Routes, useNavigate } from 'react-router-dom';
-import ModelViewBar from './components/ModelViewBar';
+import AssetsPanel from './components/AssetsPanel';
+import HierarchyPanel from './components/HierarchyPanel';
+import InspectorPanel from './components/InspectorPanel';
+import SceneView from './components/SceneView';
 import TemplateMarketplaceModal from './components/TemplateMarketplaceModal';
+import Toolbar from './components/Toolbar';
 import UniversalTemplateBuilder from './components/UniversalTemplateBuilder';
 import { apiClient } from './lib/apiClient';
 import { buildLaunchEvidencePack } from './lib/launchEvidencePack';
@@ -66,12 +56,12 @@ import { createTrainingEngine, runTrainingStep } from './lib/realTrainingEngine'
 import { createRunQueueItem, getQueueSummary } from './lib/runQueue';
 import { evaluateSimReadiness, runReadinessScenarioSuite } from './lib/simReadiness';
 import {
-    HERO_TEMPLATE_PRESETS,
-    compileTemplateToScene,
-    createDefaultTemplateSpec,
-    getModelCompatibility,
-    getModelProfile,
-    normalizeSceneForEditor,
+  HERO_TEMPLATE_PRESETS,
+  compileTemplateToScene,
+  createDefaultTemplateSpec,
+  getModelCompatibility,
+  getModelProfile,
+  normalizeSceneForEditor,
 } from './lib/templateEngine';
 import { createBenchmarkTracker, summarizeBenchmark, updateBenchmarkTracker } from './lib/trainingBenchmark';
 
@@ -621,6 +611,7 @@ function Editor({ workspace, onExit }) {
   
   const [isTraining, setIsTraining] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
+  const [trainingMode, setTrainingMode] = useState('lightweight');
   const [viewMode, setViewMode] = useState('scene');
   const [savedEditState, setSavedEditState] = useState(null); 
   
@@ -651,6 +642,21 @@ function Editor({ workspace, onExit }) {
   const [latestEpisodeMetrics, setLatestEpisodeMetrics] = useState(null);
   const [currentEpsilon, setCurrentEpsilon] = useState(0);
   const benchmarkSummary = useMemo(() => summarizeBenchmark(benchmarkTracker), [benchmarkTracker]);
+  const providerStatus = useMemo(() => {
+    if (trainingMode === 'ml') {
+      return {
+        label: 'Provider: ML Backend',
+        className: 'text-emerald-300',
+        title: 'Remote ML training provider selected',
+      };
+    }
+
+    return {
+      label: 'Provider: Lightweight RL',
+      className: 'text-[#9fc3f0]',
+      title: 'Local lightweight provider selected',
+    };
+  }, [trainingMode]);
   const [bridgeHealth, setBridgeHealth] = useState({
     status: 'checking',
     configured: false,
@@ -1218,6 +1224,96 @@ function Editor({ workspace, onExit }) {
     setObjects(preparedObjects);
     return { preparedObjects, addedAgent: !hasAgent, addedGoal: !hasGoal };
   }, [objects, workspace.is2D]);
+
+  const handleToggleTraining = useCallback(() => {
+    if (isTraining) {
+      persistModelSnapshot();
+      trainerRef.current = null;
+      setIsTraining(false);
+      setActiveTabBottom('ml-agents');
+      triggerToast('Training paused.', 'info');
+      return;
+    }
+
+    const prep = ensureTrainingSceneReady();
+    if (prep.addedAgent || prep.addedGoal) {
+      triggerToast(`Prepared scene for training${prep.addedAgent ? ' (agent added)' : ''}${prep.addedGoal ? ' (goal added)' : ''}.`, 'info');
+    }
+
+    if (!isPlaying) {
+      togglePlayMode(prep.preparedObjects);
+    }
+
+    const firstAgentId = prep.preparedObjects.find((item) => item?.agent)?.id;
+    if (firstAgentId) setSelectedId(firstAgentId);
+
+    triggerToast(`Initializing ${modelId.toUpperCase()} training engine...`, 'info');
+    const queued = enqueueModelRun(prep.preparedObjects.length);
+    if (!queued) return;
+
+    trainerRef.current = createTrainingEngine(modelId, {
+      deterministic: benchmarkMode,
+      seed: benchmarkSeedRef.current,
+    });
+
+    if (benchmarkMode) {
+      setBenchmarkTracker(createBenchmarkTracker({
+        model: modelId,
+        environment: workspace.template,
+        is2D: workspace.is2D,
+        seed: benchmarkSeedRef.current,
+      }));
+      triggerToast(`Benchmark mode ON (seed ${benchmarkSeedRef.current})`, 'info');
+    } else {
+      setBenchmarkTracker(null);
+    }
+
+    setRunQueue((prev) => {
+      let promoted = false;
+      return prev.map((run) => {
+        if (!promoted && run.status === 'queued') {
+          promoted = true;
+          return {
+            ...run,
+            status: 'running',
+            startedAt: run.startedAt || Date.now(),
+            progress: Math.max(run.progress, 2),
+          };
+        }
+        return run;
+      });
+    });
+
+    setIsTraining(true);
+    setActiveTabBottom('runs');
+    triggerToast('Training started. Live run details opened in Run Queue.', 'success');
+  }, [
+    isTraining,
+    persistModelSnapshot,
+    ensureTrainingSceneReady,
+    isPlaying,
+    togglePlayMode,
+    modelId,
+    enqueueModelRun,
+    benchmarkMode,
+    workspace.template,
+    workspace.is2D,
+    triggerToast,
+  ]);
+
+  const handleTestModels = useCallback(() => {
+    setActiveTabBottom('project');
+    triggerToast('Load a model from the Assets panel, then press Play to test.', 'info');
+  }, [triggerToast]);
+
+  const handleRenameObject = useCallback((id, name) => {
+    setObjects((prev) => prev.map((obj) => (obj.id === id ? { ...obj, name } : obj)));
+  }, []);
+
+  const handleAddAsset = useCallback((type) => {
+    const isRobotAsset = ['rover', 'drone', 'humanoid', 'robotic_arm'].includes(type);
+    handleAddObject(type, isRobotAsset);
+  }, [handleAddObject]);
 
   const handleDeleteObject = useCallback((targetId = selectedId) => {
     if (targetId && !isPlaying) {
@@ -2130,100 +2226,20 @@ function Editor({ workspace, onExit }) {
         className="hidden"
       />
 
-      <div className="h-10 bg-[#383838] border-b border-[#252526] flex items-center px-3 justify-between z-10 flex-shrink-0 select-none">
-        <div className="flex space-x-1 bg-[#2b2b2c] rounded-sm p-1 border border-[#4b4b4e] shadow-inner">
-          <ToolButton title="Translate (W)" icon={<Move size={18} />} active={transformMode === 'translate'} onClick={() => setTransformMode('translate')} disabled={isPlaying} />
-          <ToolButton title="Rotate (E)" icon={<RotateCcw size={18} />} active={transformMode === 'rotate'} onClick={() => setTransformMode('rotate')} disabled={isPlaying} />
-          <ToolButton title="Scale (R)" icon={<Maximize size={18} />} active={transformMode === 'scale'} onClick={() => setTransformMode('scale')} disabled={isPlaying} />
-        </div>
-        
-        <div className="flex space-x-4">
-          <button 
-            onClick={() => togglePlayMode()}
-            className={`px-5 py-1 rounded-sm flex items-center justify-center transition-all duration-200 shadow-lg border ${isPlaying ? 'bg-[#c94b4b] text-white border-[#a23a3a] hover:bg-[#a23a3a]' : 'bg-[#2b2b2c] text-gray-200 border-[#4f4f52] hover:bg-[#3a72b8] hover:text-white hover:border-[#3a72b8]'}`}
-            title="Start Physics & Time (Space)"
-          >
-            {isPlaying ? <Square size={16} className="mr-2 fill-current" /> : <Play size={16} className="mr-2 fill-current" />}
-            <span className="font-extrabold tracking-wide">{isPlaying ? 'STOP' : 'PLAY'}</span>
-          </button>
-        </div>
-
-        <div className="flex space-x-3">
-          <button
-            onClick={() => {
-              if (isTraining) {
-                persistModelSnapshot();
-                trainerRef.current = null;
-                setIsTraining(false);
-                setActiveTabBottom('ml-agents');
-                triggerToast('Training paused.', 'info');
-                return;
-              }
-
-              const prep = ensureTrainingSceneReady();
-              if (prep.addedAgent || prep.addedGoal) {
-                triggerToast(`Prepared scene for training${prep.addedAgent ? ' (agent added)' : ''}${prep.addedGoal ? ' (goal added)' : ''}.`, 'info');
-              }
-
-              if (!isPlaying) {
-                togglePlayMode(prep.preparedObjects);
-              }
-
-              const firstAgentId = prep.preparedObjects.find((item) => item?.agent)?.id;
-              if (firstAgentId) {
-                setSelectedId(firstAgentId);
-              }
-
-              triggerToast(`Initializing ${modelId.toUpperCase()} training engine...`, 'info');
-              const queued = enqueueModelRun(prep.preparedObjects.length);
-              if (!queued) return;
-
-              trainerRef.current = createTrainingEngine(modelId, {
-                deterministic: benchmarkMode,
-                seed: benchmarkSeedRef.current,
-              });
-
-              if (benchmarkMode) {
-                setBenchmarkTracker(createBenchmarkTracker({
-                  model: modelId,
-                  environment: workspace.template,
-                  is2D: workspace.is2D,
-                  seed: benchmarkSeedRef.current,
-                }));
-                triggerToast(`Benchmark mode ON (seed ${benchmarkSeedRef.current})`, 'info');
-              } else {
-                setBenchmarkTracker(null);
-              }
-
-              setRunQueue((prev) => {
-                let promoted = false;
-                return prev.map((run) => {
-                  if (!promoted && run.status === 'queued') {
-                    promoted = true;
-                    return {
-                      ...run,
-                      status: 'running',
-                      startedAt: run.startedAt || Date.now(),
-                      progress: Math.max(run.progress, 2),
-                    };
-                  }
-                  return run;
-                });
-              });
-
-              setIsTraining(true);
-              setActiveTabBottom('runs');
-              triggerToast('Training started. Live run details opened in Run Queue.', 'success');
-            }}
-            className={`px-4 py-1 rounded-sm font-extrabold text-[11px] flex items-center space-x-2 transition-all duration-300 shadow-inner border uppercase tracking-wide ${
-              isTraining ? 'bg-[#3a72b8] text-white border-[#2b5f9f] shadow-[0_0_16px_rgba(58,114,184,0.45)]' : 'bg-[#2b3442] text-[#9fc3f0] border-[#3a72b8] hover:bg-[#344a64]'
-            }`}
-          >
-            <BrainCircuit size={18} className={isTraining ? 'animate-pulse' : ''} />
-            <span>{isTraining ? 'HALT TRAINING' : isPlaying ? 'TRAIN AI POLICY' : 'PLAY & TRAIN'}</span>
-          </button>
-        </div>
-      </div>
+      <Toolbar
+        isPlaying={isPlaying}
+        isTraining={isTraining}
+        onTogglePlay={() => togglePlayMode()}
+        onToggleTraining={handleToggleTraining}
+        onTestModels={handleTestModels}
+        trainingEpoch={trainingEpoch}
+        latestEpisodeMetrics={latestEpisodeMetrics}
+        providerStatusLabel={providerStatus.label}
+        providerStatusClass={providerStatus.className}
+        providerStatusTitle={providerStatus.title}
+        trainingMode={trainingMode}
+        setTrainingMode={setTrainingMode}
+      />
 
       {/* 3. MIDDLE WORKSPACE */}
       <div className="flex flex-col flex-1 overflow-hidden" onClick={() => setActiveMenu(null)}>
@@ -2232,53 +2248,17 @@ function Editor({ workspace, onExit }) {
           {/* LEFT: HIERARCHY */}
           {!leftCollapsed && (
             <div style={{ width: leftWidth }} className="bg-[#2b2b2c] border-[#1e1e1e] flex flex-col z-10 shadow-xl flex-shrink-0 select-none">
-              <div className="h-9 bg-[#303031] flex items-center px-3 border-b border-[#1f1f1f] font-semibold text-[11px] text-gray-300 tracking-wide uppercase">
-                <Layers size={16} className="mr-3 text-gray-500" />
-                Hierarchy
-                <div className="ml-auto flex items-center space-x-3">
-                  <button
-                    type="button"
-                    aria-label="Add object"
-                    disabled={isPlaying}
-                    onClick={(e) => { if (!isPlaying) toggleMenu(e, 'gameobject'); }}
-                    className="p-0 bg-transparent disabled:cursor-not-allowed"
-                  >
-                    <Plus size={16} className={`${isPlaying ? 'text-gray-600' : 'text-gray-400 hover:text-white cursor-pointer transition-colors'}`} />
-                  </button>
-                  <button
-                    type="button"
-                    aria-label="Collapse hierarchy panel"
-                    title="Collapse Panel"
-                    onClick={(e) => { e.stopPropagation(); setLeftCollapsed(true); }}
-                    className="p-0 bg-transparent"
-                  >
-                    <ChevronsLeft size={16} className="text-gray-500 hover:text-white cursor-pointer transition-colors" />
-                  </button>
-                </div>
-              </div>
-              <div className="p-2.5 border-b border-[#222] bg-[#252526]">
-                <input aria-label="Search hierarchy" value={hierarchyQuery} onChange={(e) => setHierarchyQuery(e.target.value)} type="text" placeholder="Search by name or type..." className="w-full bg-[#1f1f20] text-[#ddd] px-3 py-1.5 rounded-sm text-[11px] border border-[#3d3d3d] focus:outline-none focus:border-[#3a72b8] transition-colors shadow-inner" />
-              </div>
-              <div 
-                 className="flex-1 overflow-y-auto py-3"
-                 onContextMenu={(e) => handleContextMenu(e, 'hierarchy', null)}
-                 onClick={() => setSelectedId(null)}
-              >
-                <div className="px-4 py-1 text-[10px] text-gray-500 uppercase font-black tracking-widest flex items-center mb-2">
-                  <ChevronDown size={14} className="mr-2" />
-                  World Root
-                </div>
-                {hierarchyNodes || (
-                  <div className="px-4 py-8 text-center">
-                    <div className="text-gray-500 text-[11px] font-bold uppercase tracking-wider">
-                      {hierarchyQuery.trim() ? 'No matching objects' : 'No objects in scene'}
-                    </div>
-                    <div className="text-gray-600 text-[10px] mt-2">
-                      {hierarchyQuery.trim() ? 'Try a different name or type filter.' : 'Use the add button to create your first object.'}
-                    </div>
-                  </div>
-                )}
-              </div>
+              <HierarchyPanel
+                objects={objects}
+                selectedId={selectedId}
+                onSelect={setSelectedId}
+                onRename={handleRenameObject}
+                onAddObject={handleAddObject}
+                onDeleteObject={handleDeleteObject}
+                isPlaying={isPlaying}
+                query={hierarchyQuery}
+                onQueryChange={setHierarchyQuery}
+              />
             </div>
           )}
 
@@ -2286,104 +2266,25 @@ function Editor({ workspace, onExit }) {
 
           {/* CENTER: SCENE VIEW */}
           <div className="flex-1 bg-[#252526] flex flex-col relative outline-none min-w-0">
-            <div className="h-9 bg-[#303031] flex items-center px-3 border-b border-[#1f1f1f] space-x-2 z-10 shadow-md select-none">
-              {leftCollapsed && (
-                 <button onClick={() => setLeftCollapsed(false)} className="mr-2 p-1.5 bg-[#1f1f20] hover:bg-[#343435] text-gray-400 hover:text-white rounded border border-[#3d3d3f] transition-colors shadow-inner" title="Expand Scene Graph">
-                    <ChevronsRight size={16} />
-                 </button>
-              )}
-              <button
-                type="button"
-                aria-label="Switch to Scene view"
-                className={`px-4 py-1 text-[11px] font-extrabold rounded-sm transition-all uppercase tracking-wide ${viewMode === 'scene' ? 'bg-[#3a72b8] text-white shadow-inner' : 'text-gray-400 hover:text-gray-200'}`}
-                onClick={() => setViewMode('scene')}
-              >
-                Scene
-              </button>
-              <button
-                type="button"
-                aria-label="Switch to Game view"
-                className={`px-4 py-1 text-[11px] font-extrabold rounded-sm transition-all uppercase tracking-wide ${viewMode === 'game' ? 'bg-[#3a72b8] text-white shadow-inner' : 'text-gray-400 hover:text-gray-200'}`}
-                onClick={() => setViewMode('game')}
-              >
-                Game
-              </button>
-              
-              <div className="flex-1"></div>
-              
-              <div className="flex items-center space-x-1 bg-[#2a2a2b] p-1 rounded-sm border border-[#3d3d3d] mr-3 shadow-inner">
-                 <button title="Toggle 3D Grid" onClick={() => setShowGrid(!showGrid)} className={`p-1.5 rounded-sm transition-colors ${showGrid ? 'bg-[#3a72b8] text-white' : 'text-gray-500 hover:text-gray-300 hover:bg-[#343435]'}`}><Grid size={14}/></button>
-                  <button title={gridFollowCamera ? 'Grid follows camera sectors' : 'Grid locked to world origin'} onClick={() => setGridFollowCamera((prev) => !prev)} className={`p-1.5 rounded-sm transition-colors ${gridFollowCamera ? 'bg-[#3a72b8] text-white' : 'text-gray-500 hover:text-gray-300 hover:bg-[#343435]'}`}><Move size={14}/></button>
-                 <button title="Toggle Environment" onClick={() => setSkyboxType(skyboxType === 'unity' ? 'dark' : 'unity')} className={`p-1.5 rounded-sm transition-colors ${skyboxType === 'unity' ? 'bg-[#3a72b8] text-white' : 'text-gray-500 hover:text-gray-300 hover:bg-[#343435]'}`}><ImageIcon size={14}/></button>
-              </div>
-
-              <div className="text-[11px] font-semibold text-gray-300 flex items-center space-x-2 bg-[#2a2a2b] px-3 py-1 rounded-sm border border-[#3d3d3d] shadow-inner">
-                <Video size={15} className="text-[#6ea8f5]"/> <span>Perspective</span>
-              </div>
-              
-              {rightCollapsed && (
-                 <button onClick={() => setRightCollapsed(false)} className="ml-2 p-1.5 bg-[#1f1f20] hover:bg-[#343435] text-gray-400 hover:text-white rounded border border-[#3d3d3f] transition-colors shadow-inner" title="Expand Properties">
-                    <ChevronsLeft size={16} />
-                 </button>
-              )}
-            </div>
-            
-            <div className={`flex-1 relative overflow-hidden bg-[#111] ${isDraggingPane ? 'pointer-events-none' : ''}`}>
-              {bottomCollapsed && (
-                 <button onClick={() => setBottomCollapsed(false)} className="absolute bottom-6 left-6 z-50 p-2.5 bg-[#1f1f20] hover:bg-[#2f2f31] text-gray-300 hover:text-white rounded-lg border border-[#3d3d3f] shadow-[0_5px_15px_rgba(0,0,0,0.6)] transition-all flex items-center" title="Expand Bottom Panel">
-                    <ChevronsUp size={18} className="mr-3 text-[#007acc]"/>
-                    <span className="text-xs font-black tracking-widest uppercase">Show Logs & Assets</span>
-                 </button>
-              )}
-              <ThreeJsView 
-                objects={objects} 
-                isPlaying={isPlaying}
-                isTraining={isTraining}
-                selectedId={selectedId} 
-                transformMode={transformMode}
-                onTransformChange={handleTransformGizmoUpdate}
-                showGrid={showGrid}
-                gridFollowCamera={gridFollowCamera}
-                skyboxType={skyboxType}
-                is2D={workspace.is2D}
-                environmentProfile={environmentProfile}
-                focusTrigger={focusTrigger}
-              />
-
-              {/* FLOATING AGENT POV CAMERA UI OVERLAY */}
-              {selectedObject?.agent && !workspace.is2D && (
-                 <div className="absolute z-40 pointer-events-none flex flex-col" style={{ bottom: 24, right: 24, width: 320, height: 180 }}>
-                    <div className="w-full px-3 py-1 bg-[#3a72b8] text-white font-black text-[10px] tracking-widest uppercase flex justify-between items-center shadow-lg rounded-t-md border border-[#2b5f9f]">
-                       <span><Video size={12} className="inline mr-2 -mt-0.5"/> Agent POV</span>
-                       <span className="animate-pulse">● REC</span>
-                    </div>
-                    {/* The actual video is rendered underneath this transparent div by WebGL Scissor */}
-                    <div className="w-full h-full border-2 border-[#3a72b8] rounded-b-md shadow-[0_0_20px_rgba(58,114,184,0.35)]"></div>
-                 </div>
-              )}
-              
-              {isTraining && (
-                <div className="absolute top-6 left-6 bg-[#111111ee] p-4 rounded-lg border border-[#3a72b8] pointer-events-none shadow-[0_0_26px_rgba(58,114,184,0.2)] backdrop-blur-xl z-50">
-                  <div className="text-[#9fc3f0] font-black flex items-center space-x-3 mb-3 text-xs tracking-widest uppercase">
-                    <Activity size={20} className="animate-pulse" />
-                    <span>{modelId.toUpperCase()} Training Active</span>
-                  </div>
-                  <div className="space-y-1.5 font-mono text-xs">
-                     <div className="text-gray-400 flex justify-between w-56"><span>Engine:</span> <span className="text-green-400 font-bold">PhysX / RL</span></div>
-                     <div className="text-gray-400 flex justify-between w-56"><span>Model Strategy:</span> <span className="text-[#9fc3f0] font-bold">{modelProfile.strategy}</span></div>
-                     <div className="text-gray-400 flex justify-between w-56"><span>Epoch:</span> <span className="text-white font-bold">{trainingEpoch}</span></div>
-                     <div className="text-gray-400 flex justify-between w-56"><span>Episode Step:</span> <span className="text-white font-bold">{Number(latestEpisodeMetrics?.episodeStep || 0)} / 180</span></div>
-                     <div className="text-gray-400 flex justify-between w-56"><span>Env Steps:</span> <span className="text-white font-bold">{Number(latestEpisodeMetrics?.totalSteps || 0).toLocaleString()}</span></div>
-                     <div className="text-gray-400 flex justify-between w-56"><span>Last Reward:</span> <span className="text-[#9fc3f0] font-bold">{Number(latestEpisodeMetrics?.reward || 0).toFixed(2)}</span></div>
-                     <div className="text-gray-400 flex justify-between w-56"><span>Avg Reward (25):</span> <span className="text-[#9fc3f0] font-bold">{trainingInsights.avgReward.toFixed(2)}</span></div>
-                     <div className="text-gray-400 flex justify-between w-56"><span>Solved Rate (25):</span> <span className="text-green-400 font-bold">{trainingInsights.solvedRate.toFixed(1)}%</span></div>
-                     <div className="text-gray-400 flex justify-between w-56"><span>Exploration ε:</span> <span className="text-yellow-300 font-bold">{Number(latestEpisodeMetrics?.epsilon ?? currentEpsilon ?? 0).toFixed(3)}</span></div>
-                     <div className="text-gray-400 flex justify-between w-56"><span>Goal Distance:</span> <span className="text-white font-bold">{Number(latestEpisodeMetrics?.distance || 0).toFixed(2)}</span></div>
-                     <div className="text-gray-400 flex justify-between w-56"><span>Obstacle Clearance:</span> <span className="text-white font-bold">{Number(trainingInsights.avgClearance ?? latestEpisodeMetrics?.clearance ?? 0).toFixed(2)}</span></div>
-                  </div>
-                </div>
-              )}
-            </div>
+            <SceneView
+              viewComponent={ThreeJsView}
+              objects={objects}
+              isPlaying={isPlaying}
+              isTraining={isTraining}
+              selectedId={selectedId}
+              transformMode={transformMode}
+              onTransformChange={handleTransformGizmoUpdate}
+              showGrid={showGrid}
+              setShowGrid={setShowGrid}
+              gridFollowCamera={gridFollowCamera}
+              setGridFollowCamera={setGridFollowCamera}
+              skyboxType={skyboxType}
+              setSkyboxType={setSkyboxType}
+              is2D={workspace.is2D}
+              environmentProfile={environmentProfile}
+              focusTrigger={focusTrigger}
+              onDropAsset={handleAddAsset}
+            />
           </div>
 
           {!rightCollapsed && <div className={`w-[6px] bg-[#202022] hover:bg-[#3a72b8] cursor-col-resize z-50 flex-shrink-0 transition-colors ${isDraggingPane === 'right' ? 'bg-[#3a72b8]' : ''}`} onMouseDown={(e) => { e.preventDefault(); setIsDraggingPane('right'); }} />}
@@ -2395,201 +2296,12 @@ function Editor({ workspace, onExit }) {
                 Inspector {isPlaying && <span className="ml-3 px-2 py-0.5 bg-red-900/30 text-red-400 border border-red-800 rounded-sm text-[9px] font-black">LOCKED IN PLAY MODE</span>}
               </div>
 
-              <div className="p-4 border-b border-[#1f1f1f] bg-[#1a1a1a]">
-                <ModelViewBar
-                  project={workspace}
-                  engineRef={trainerRef}
-                  onLoaded={() => triggerToast('Model loaded from storage.', 'success')}
-                />
-              </div>
-
-              {selectedObject ? (
-                <div className={`p-4 space-y-5 pb-24 ${isPlaying ? 'opacity-50 pointer-events-none' : ''}`}>
-                  <div className="flex items-center space-x-3 pb-4 border-b border-[#333]">
-                    {selectedObject.type === 'light' ? <Zap size={28} className="text-yellow-500" /> : <Box size={28} className={selectedObject.agent ? "text-[#00ffcc]" : "text-gray-400"} />}
-                    <input
-                      type="text"
-                      value={selectedObject.name}
-                      onChange={(e) => updateObject(selectedObject.id, 'name', e.target.value)}
-                      className="flex-1 bg-[#111] border border-[#444] px-3 py-2 text-sm font-black text-white focus:border-[#007acc] outline-none rounded-md min-w-0 transition-colors shadow-inner"
-                    />
-                  </div>
-
-                  <ComponentPanel title="Transform" icon={<Move size={16}/>}>
-                    <Vector3Input label="Position" value={selectedObject.pos} onChange={(v) => updateObject(selectedObject.id, 'pos', v)} />
-                    <Vector3Input label="Rotation" value={selectedObject.rot} onChange={(v) => updateObject(selectedObject.id, 'rot', v)} />
-                    <Vector3Input label="Scale" value={selectedObject.scale} onChange={(v) => updateObject(selectedObject.id, 'scale', v)} />
-                  </ComponentPanel>
-
-                  {selectedObject.type === 'light' && (
-                    <ComponentPanel title="Light Settings" icon={<Zap size={16}/>}>
-                       <div className="space-y-3 text-xs text-gray-400 bg-[#111] p-3 rounded border border-[#333]">
-                         <p className="italic font-medium">Use the 3D transform gizmo to move the light source and adjust the scene's shadows in real-time.</p>
-                       </div>
-                    </ComponentPanel>
-                  )}
-
-                  {/* Optional Rendering Component */}
-                  {!selectedObject.agent && selectedObject.type !== 'light' && selectedObject.type !== 'empty' && (
-                    <ComponentPanel title="PBR Material" icon={<Circle size={16}/>}>
-                       <div className="space-y-4 text-xs font-bold">
-                         <div>
-                           <div className="text-gray-500 uppercase tracking-wider text-[10px] mb-2">Quick Styles</div>
-                           <div className="grid grid-cols-2 gap-2">
-                             <button onClick={() => applyMaterialPreset(selectedObject.id, 'brushed-steel')} className="text-[10px] px-2 py-1.5 rounded border border-[#3d3d3f] bg-[#181818] text-gray-300 hover:bg-[#233041] hover:border-[#3a72b8] transition-colors">Brushed Steel</button>
-                             <button onClick={() => applyMaterialPreset(selectedObject.id, 'carbon-fiber')} className="text-[10px] px-2 py-1.5 rounded border border-[#3d3d3f] bg-[#181818] text-gray-300 hover:bg-[#233041] hover:border-[#3a72b8] transition-colors">Carbon Fiber</button>
-                             <button onClick={() => applyMaterialPreset(selectedObject.id, 'matte-polymer')} className="text-[10px] px-2 py-1.5 rounded border border-[#3d3d3f] bg-[#181818] text-gray-300 hover:bg-[#233041] hover:border-[#3a72b8] transition-colors">Matte Polymer</button>
-                             <button onClick={() => applyMaterialPreset(selectedObject.id, 'neon-ceramic')} className="text-[10px] px-2 py-1.5 rounded border border-[#3d3d3f] bg-[#181818] text-gray-300 hover:bg-[#233041] hover:border-[#3a72b8] transition-colors">Neon Ceramic</button>
-                             <button onClick={() => applyMaterialPreset(selectedObject.id, 'hazard-shell')} className="text-[10px] px-2 py-1.5 rounded border border-[#3d3d3f] bg-[#181818] text-gray-300 hover:bg-[#233041] hover:border-[#3a72b8] transition-colors col-span-2">Hazard Shell</button>
-                           </div>
-                         </div>
-                         <div className="flex items-center justify-between bg-[#111] p-2 rounded border border-[#333]">
-                            <span className="text-gray-400">Albedo (Base Color)</span>
-                            <input type="color" value={selectedObject.color || '#ffffff'} onChange={(e) => updateObject(selectedObject.id, 'color', e.target.value)} className="w-10 h-10 rounded cursor-pointer bg-transparent border-none" />
-                         </div>
-                         <div className="flex items-center justify-between">
-                           <span className="text-gray-400">Metalness</span>
-                           <input type="range" min="0" max="1" step="0.05" value={selectedObject.metalness ?? 0.1} onChange={(e) => updateObject(selectedObject.id, 'metalness', parseFloat(e.target.value))} className="w-32 accent-[#3a72b8]" />
-                         </div>
-                         <div className="flex items-center justify-between">
-                           <span className="text-gray-400">Roughness</span>
-                           <input type="range" min="0" max="1" step="0.05" value={selectedObject.roughness ?? 0.8} onChange={(e) => updateObject(selectedObject.id, 'roughness', parseFloat(e.target.value))} className="w-32 accent-[#3a72b8]" />
-                         </div>
-                       </div>
-                    </ComponentPanel>
-                  )}
-
-                  {/* Optional Physics Component */}
-                  {selectedObject.type !== 'light' && selectedObject.mass !== undefined && (
-                    <ComponentPanel title="Rigidbody Physics" icon={<Box size={16}/>}>
-                      <div className="space-y-3 text-xs font-bold">
-                         <div className="flex justify-between items-center bg-[#111] p-2 rounded border border-[#333]">
-                            <span className="text-gray-300">Mass (kg)</span>
-                            <input type="number" value={selectedObject.mass} onChange={(e) => updateObject(selectedObject.id, 'mass', parseFloat(e.target.value)||0)} className="w-24 bg-[#222] border border-[#444] p-1.5 text-white text-right rounded outline-none focus:border-[#3a72b8] transition-colors" />
-                         </div>
-                         <div className="flex justify-between items-center">
-                            <span className="text-gray-500">Static Friction</span>
-                            <input type="number" step="0.1" value={selectedObject.friction ?? 0.3} onChange={(e) => updateObject(selectedObject.id, 'friction', parseFloat(e.target.value)||0)} className="w-20 bg-[#111] border border-[#333] p-1.5 text-gray-300 text-right rounded outline-none focus:border-[#007acc] transition-colors" />
-                         </div>
-                         <div className="flex justify-between items-center">
-                            <span className="text-gray-500">Restitution (Bounce)</span>
-                            <input type="number" step="0.1" value={selectedObject.restitution ?? 0.1} onChange={(e) => updateObject(selectedObject.id, 'restitution', parseFloat(e.target.value)||0)} className="w-20 bg-[#111] border border-[#333] p-1.5 text-gray-300 text-right rounded outline-none focus:border-[#007acc] transition-colors" />
-                         </div>
-                      </div>
-                    </ComponentPanel>
-                  )}
-
-                  {/* Optional Joint/Actuator Component */}
-                  {selectedObject.joint && (
-                     <ComponentPanel title="Actuator / Joint Config" icon={<Settings size={16}/>}>
-                        <div className="space-y-3 text-xs font-bold">
-                           <div className="flex justify-between items-center">
-                              <span className="text-gray-400">Joint Type</span>
-                              <span className="bg-[#222] text-[#f39c12] px-3 py-1 rounded border border-[#444] uppercase tracking-wider">{selectedObject.joint}</span>
-                           </div>
-                           <div className="flex justify-between items-center mt-2">
-                               <span className="text-gray-500">Motor Torque (Nm)</span>
-                               <input type="number" defaultValue={selectedObject.motor ? 50 : 0} className="w-20 bg-[#111] border border-[#333] p-1.5 text-gray-300 text-right rounded outline-none focus:border-[#f39c12] transition-colors" />
-                           </div>
-                        </div>
-                     </ComponentPanel>
-                  )}
-
-                  {/* AI Agent Component */}
-                  {selectedObject.agent && (
-                    <ComponentPanel title="Sim2Real AI Controller" icon={<BrainCircuit size={16}/>} accent>
-                      <div className="space-y-5">
-                        {/* Sensors */}
-                        <div className="bg-[#111] p-3 rounded-lg border border-[#3a72b844] space-y-3 shadow-inner">
-                          <div className="text-xs text-[#9fc3f0] font-black uppercase tracking-widest flex items-center mb-2"><Crosshair size={14} className="mr-2"/> Sensor Suite</div>
-                          
-                          <div className="flex items-center justify-between text-xs border-b border-[#222] pb-3">
-                            <span className="text-white font-bold">Raycast LiDAR Array</span>
-                            <input type="checkbox" checked={selectedObject.sensors} onChange={(e) => updateObject(selectedObject.id, 'sensors', e.target.checked)} className="accent-[#3a72b8] w-4 h-4 cursor-pointer" />
-                          </div>
-                          <div className="flex items-center justify-between text-xs border-b border-[#222] pb-3">
-                            <span className="text-gray-400 font-bold">Gaussian Noise Var.</span>
-                            <input type="number" defaultValue={0.05} step="0.01" className="w-16 bg-[#222] border border-[#444] p-1 text-white text-right rounded outline-none" />
-                          </div>
-                          <div className="flex items-center justify-between text-xs pt-1">
-                            <span className="text-white font-bold">RGB Camera POV</span>
-                            <span className="text-[10px] bg-[#3a72b8] text-white px-2 py-1 rounded font-black shadow tracking-wider">ACTIVE</span>
-                          </div>
-                        </div>
-
-                        {/* Domain Randomization */}
-                        <div className="bg-[#111] p-3 rounded-lg border border-[#f39c1244] space-y-3 shadow-inner">
-                           <div className="text-xs text-[#f39c12] font-black uppercase tracking-widest flex items-center mb-2"><RefreshCw size={14} className="mr-2"/> Domain Randomization</div>
-                           <div className="flex items-center justify-between text-xs">
-                               <span className="text-gray-400 font-bold">Mass Variance</span>
-                               <span className="text-white font-mono">± 15%</span>
-                           </div>
-                           <div className="flex items-center justify-between text-xs">
-                               <span className="text-gray-400 font-bold">Friction Variance</span>
-                               <span className="text-white font-mono">± 20%</span>
-                           </div>
-                        </div>
-
-                        <div className="bg-[#111] p-3 rounded-lg border border-[#333] space-y-2 shadow-inner">
-                          <div className="text-xs text-gray-500 mb-2 font-black uppercase tracking-widest">Target Objective</div>
-                          <select className="w-full bg-[#222] border border-[#444] p-2 text-white text-xs font-bold rounded outline-none focus:border-[#3a72b8] cursor-pointer">
-                            <option>Reach Spatial Goal</option>
-                            <option>Maintain Balance</option>
-                            <option>Pick and Place</option>
-                          </select>
-                        </div>
-
-                        <div className="pt-3">
-                          <button
-                            onClick={() => setBenchmarkMode((prev) => !prev)}
-                            className={`px-3 py-1 rounded-sm text-[10px] font-extrabold uppercase tracking-wide border transition-colors ${
-                              benchmarkMode ? 'bg-[#3a72b8] text-white border-[#2b5f9f]' : 'bg-[#2b2b2c] text-gray-300 border-[#4f4f52] hover:border-[#3a72b8]'
-                            }`}
-                            title="Deterministic benchmark mode"
-                          >
-                            {benchmarkMode ? 'Benchmark ON' : 'Benchmark OFF'}
-                          </button>
-                          <button 
-                            onClick={() => setShowDeployModal(true)}
-                            className="w-full py-3 bg-[#3a72b8] hover:bg-[#2b5f9f] text-white font-black text-xs rounded-lg transition-all shadow-[0_0_15px_rgba(58,114,184,0.2)] hover:shadow-[0_0_25px_rgba(58,114,184,0.35)] flex justify-center items-center uppercase tracking-widest">
-                            <TerminalSquare size={18} className="mr-3"/> Compile ROS2 Node
-                          </button>
-                        </div>
-                      </div>
-                    </ComponentPanel>
-                  )}
-
-                  {/* ADD COMPONENT BUTTON SYSTEM */}
-                  <div className="relative mt-8 border-t border-[#333] pt-6">
-                      <button 
-                         onClick={() => setShowAddComponent(!showAddComponent)}
-                         className="w-full py-3 bg-[#111] hover:bg-[#222] text-white font-black text-xs rounded-lg border border-[#444] hover:border-[#3a72b8] transition-all tracking-widest uppercase shadow-md"
-                      >
-                         Add Component
-                      </button>
-                      {showAddComponent && (
-                         <div className="absolute bottom-full left-0 w-full mb-2 bg-[#1a1a1a] border border-[#444] rounded-lg shadow-2xl py-2 z-50 overflow-hidden">
-                             {selectedObject.mass === undefined && (
-                                 <div className="px-5 py-3 hover:bg-[#3a72b8] text-gray-300 hover:text-white cursor-pointer text-xs font-bold flex items-center transition-colors" onClick={() => { updateObject(selectedObject.id, 'mass', 1); setShowAddComponent(false); triggerToast("Added Rigidbody"); }}><Box size={16} className="mr-3"/> Physics Rigidbody</div>
-                             )}
-                             {!selectedObject.agent && (
-                                 <div className="px-5 py-3 hover:bg-[#3a72b8] text-gray-300 hover:text-white cursor-pointer text-xs font-bold flex items-center transition-colors" onClick={() => { updateObject(selectedObject.id, 'agent', true); updateObject(selectedObject.id, 'sensors', true); setShowAddComponent(false); triggerToast("Upgraded to Agent"); }}><BrainCircuit size={16} className="mr-3"/> ML-Agent Brain</div>
-                             )}
-                             {!selectedObject.joint && (
-                                 <div className="px-5 py-3 hover:bg-[#3a72b8] text-gray-300 hover:text-white cursor-pointer text-xs font-bold flex items-center transition-colors" onClick={() => { updateObject(selectedObject.id, 'joint', 'hinge'); setShowAddComponent(false); triggerToast("Added Hinge Joint"); }}><Settings size={16} className="mr-3"/> Hinge Joint</div>
-                             )}
-                             <div className="px-5 py-3 hover:bg-[#3a72b8] text-gray-300 hover:text-white cursor-pointer text-xs font-bold flex items-center transition-colors" onClick={() => { handleAddSensorPod(selectedObject.id); setShowAddComponent(false); }}><Crosshair size={16} className="mr-3"/> Sensor Pod Mount</div>
-                         </div>
-                      )}
-                  </div>
-
-                </div>
-              ) : (
-                <div className="p-10 flex flex-col items-center justify-center text-gray-600 text-xs italic h-64">
-                  <MousePointer2 size={32} className="mb-4 opacity-50" />
-                  Select an object from Hierarchy to view Inspector properties.
-                </div>
-              )}
+              <InspectorPanel
+                selectedObject={selectedObject}
+                isPlaying={isPlaying}
+                updateObject={updateObject}
+                onAddSensorPod={handleAddSensorPod}
+              />
             </div>
           )}
         </div>
@@ -2616,46 +2328,14 @@ function Editor({ workspace, onExit }) {
                onContextMenu={(e) => activeTabBottom === 'project' && handleContextMenu(e, 'assets')}
             >
               {activeTabBottom === 'project' && (
-                <div className="flex space-x-8">
-                  <div className="w-56 border-r border-[#333] pr-6 flex-shrink-0">
-                    <div className="flex items-center text-xs text-white mb-3 font-black tracking-wide"><ChevronDown size={16} className="mr-1"/> nexus-project-root</div>
-                    <div className="ml-5 flex items-center text-xs text-gray-400 py-1.5 font-bold hover:text-white cursor-pointer transition-colors"><Folder size={16} className="mr-3 text-yellow-600"/> Scenes</div>
-                    <div className="ml-5 flex items-center text-xs text-gray-400 py-1.5 font-bold hover:text-white cursor-pointer transition-colors"><Folder size={16} className="mr-3 text-yellow-600"/> Materials</div>
-                    <div className="ml-5 flex items-center text-xs text-[#9fc3f0] font-black tracking-wide py-1.5 bg-[#3a72b822] rounded-md px-3 mt-1 cursor-pointer border border-[#3a72b855]"><BrainCircuit size={16} className="mr-3"/> Trained Policies</div>
-                    <div className="mt-4 pt-3 border-t border-[#3a3a3d]">
-                      <div className="text-[10px] text-gray-500 uppercase font-black tracking-widest mb-2">Built-in Tools</div>
-                      <button onClick={() => handleGenerateEnvironment('obstacle-field')} className="w-full text-left text-[11px] text-gray-300 bg-[#1b1b1c] hover:bg-[#2b3f5c] border border-[#3d3d3f] hover:border-[#3a72b8] rounded-sm px-3 py-2 mb-2 transition-colors">Generate Obstacle Field</button>
-                      <button onClick={() => handleGenerateEnvironment('maze-track')} className="w-full text-left text-[11px] text-gray-300 bg-[#1b1b1c] hover:bg-[#2b3f5c] border border-[#3d3d3f] hover:border-[#3a72b8] rounded-sm px-3 py-2 mb-2 transition-colors">Generate Maze Track</button>
-                      <button onClick={() => handleGenerateEnvironment('goal-course')} className="w-full text-left text-[11px] text-gray-300 bg-[#1b1b1c] hover:bg-[#2b3f5c] border border-[#3d3d3f] hover:border-[#3a72b8] rounded-sm px-3 py-2 mb-2 transition-colors">Generate Goal Course</button>
-                      <button onClick={() => handleGenerateEnvironment('warehouse-kit')} className="w-full text-left text-[11px] text-gray-300 bg-[#1b1b1c] hover:bg-[#2b3f5c] border border-[#3d3d3f] hover:border-[#3a72b8] rounded-sm px-3 py-2 mb-2 transition-colors">Generate Warehouse Kit</button>
-                      <button onClick={() => handleGenerateEnvironment('urban-kit')} className="w-full text-left text-[11px] text-gray-300 bg-[#1b1b1c] hover:bg-[#2b3f5c] border border-[#3d3d3f] hover:border-[#3a72b8] rounded-sm px-3 py-2 mb-2 transition-colors">Generate Urban Kit</button>
-                      <button onClick={() => handleGenerateEnvironment('terrain-kit')} className="w-full text-left text-[11px] text-gray-300 bg-[#1b1b1c] hover:bg-[#2b3f5c] border border-[#3d3d3f] hover:border-[#3a72b8] rounded-sm px-3 py-2 mb-2 transition-colors">Generate Terrain Kit</button>
-                      <button onClick={() => handleGenerateEnvironment('underwater-kit')} className="w-full text-left text-[11px] text-gray-300 bg-[#1b1b1c] hover:bg-[#2b3f5c] border border-[#3d3d3f] hover:border-[#3a72b8] rounded-sm px-3 py-2 mb-2 transition-colors">Generate Underwater Kit</button>
-                      <button onClick={() => handleGenerateEnvironment('space-kit')} className="w-full text-left text-[11px] text-gray-300 bg-[#1b1b1c] hover:bg-[#2b3f5c] border border-[#3d3d3f] hover:border-[#3a72b8] rounded-sm px-3 py-2 transition-colors">Generate Space Kit</button>
-                    </div>
-                    <div className="mt-4 pt-3 border-t border-[#3a3a3d] space-y-2">
-                      <div className="text-[10px] text-gray-500 uppercase font-black tracking-widest mb-1">Atmospheric Profile</div>
-                      <div className="text-[10px] text-gray-400 flex justify-between items-center"><span>Temperature (°C)</span><span className="text-white">{environmentProfile.temperatureC.toFixed(1)}</span></div>
-                      <input type="range" min="-30" max="70" step="0.5" value={environmentProfile.temperatureC} onChange={(e) => setEnvironmentProfile((prev) => ({ ...prev, temperatureC: Number(e.target.value) }))} className="w-full accent-[#3a72b8]" />
-
-                      <div className="text-[10px] text-gray-400 flex justify-between items-center"><span>Pressure (kPa)</span><span className="text-white">{environmentProfile.pressureKPa.toFixed(1)}</span></div>
-                      <input type="range" min="20" max="130" step="0.5" value={environmentProfile.pressureKPa} onChange={(e) => setEnvironmentProfile((prev) => ({ ...prev, pressureKPa: Number(e.target.value) }))} className="w-full accent-[#3a72b8]" />
-
-                      <div className="text-[10px] text-gray-400 flex justify-between items-center"><span><Droplets size={12} className="inline mr-1"/>Humidity (%)</span><span className="text-white">{environmentProfile.humidityPct.toFixed(0)}</span></div>
-                      <input type="range" min="0" max="100" step="1" value={environmentProfile.humidityPct} onChange={(e) => setEnvironmentProfile((prev) => ({ ...prev, humidityPct: Number(e.target.value) }))} className="w-full accent-[#3a72b8]" />
-
-                      <div className="text-[10px] text-gray-400 flex justify-between items-center"><span><Wind size={12} className="inline mr-1"/>Wind (m/s)</span><span className="text-white">{environmentProfile.windMps.toFixed(1)}</span></div>
-                      <input type="range" min="0" max="35" step="0.1" value={environmentProfile.windMps} onChange={(e) => setEnvironmentProfile((prev) => ({ ...prev, windMps: Number(e.target.value) }))} className="w-full accent-[#3a72b8]" />
-
-                      <button onClick={applyEnvironmentProfile} className="w-full text-[11px] font-black tracking-wide uppercase text-white bg-[#2b5f9f] hover:bg-[#3a72b8] border border-[#3a72b8] rounded-sm px-3 py-2 transition-colors">Apply Environment Physics</button>
-                    </div>
-                  </div>
-                  <div className="flex-1 flex flex-wrap gap-8 items-start">
-                    <AssetIcon name="main_env.scene" icon={<LayoutTemplate size={40} className="text-gray-300"/>} />
-                    <AssetIcon name="factory_robot.glb" icon={<Box size={40} className="text-gray-500"/>} />
-                    <AssetIcon name="policy_v4.onnx" icon={<BrainCircuit size={40} className="text-[#6ea8f5]"/>} />
-                  </div>
-                </div>
+                <AssetsPanel
+                  workspace={workspace}
+                  engineRef={trainerRef}
+                  onModelLoaded={() => triggerToast('Model loaded from storage.', 'success')}
+                  onAddAsset={handleAddAsset}
+                  trainingData={trainingData}
+                  isTraining={isTraining}
+                />
               )}
 
               {activeTabBottom === 'console' && (

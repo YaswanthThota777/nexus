@@ -1,6 +1,7 @@
 // Store trained models keyed by projectId
 const MODELS_KEY = 'nexus-models';
 export const MAX_MODELS = 20;
+export const MODELS_UPDATED_EVENT = 'nexus-models-updated';
 
 const safeParse = (raw) => {
   try {
@@ -12,7 +13,12 @@ const safeParse = (raw) => {
   }
 };
 
-const persist = (models) => localStorage.setItem(MODELS_KEY, JSON.stringify(models));
+const persist = (models) => {
+  localStorage.setItem(MODELS_KEY, JSON.stringify(models));
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new Event(MODELS_UPDATED_EVENT));
+  }
+};
 
 export function getModels(projectId) {
   const all = safeParse(localStorage.getItem(MODELS_KEY));

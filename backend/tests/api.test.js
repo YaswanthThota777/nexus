@@ -1,5 +1,5 @@
-import test from 'node:test';
 import assert from 'node:assert/strict';
+import test from 'node:test';
 import request from 'supertest';
 import { createApp } from '../src/app.js';
 
@@ -118,4 +118,39 @@ test('template marketplace publish and list works', async () => {
   assert.equal(listed.status, 200);
   assert.equal(Array.isArray(listed.body.items), true);
   assert.equal(listed.body.items.length > 0, true);
+});
+
+test('ml endpoints support train step and model save/load flow', async () => {
+  const step = await request(app).post('/api/v1/ml/train-step').send({
+    sessionId: 'session-a',
+    modelId: 'model-a',
+    state: {
+      is2D: true,
+      objects: [{ id: 'agent', pos: [0, 0, 0.5], agent: true }],
+    },
+  });
+
+  assert.equal(step.status, 200);
+  assert.equal(step.body.provider, 'ml');
+  assert.equal(step.body.stepMetrics.totalSteps >= 1, true);
+
+  const saved = await request(app).post('/api/v1/ml/save-model').send({
+    modelId: 'model-a',
+    sessionId: 'session-a',
+    payload: { weights: [1, 2, 3] },
+  });
+
+  assert.equal(saved.status, 200);
+  assert.equal(saved.body.id, 'model-a');
+
+  const loaded = await request(app).get('/api/v1/ml/models/model-a');
+  assert.equal(loaded.status, 200);
+  assert.deepEqual(loaded.body.payload, { weights: [1, 2, 3] });
+});
+
+test('ml health endpoint returns ok', async () => {
+  const health = await request(app).get('/api/v1/ml/health');
+  assert.equal(health.status, 200);
+  assert.equal(health.body.ok, true);
+  assert.equal(health.body.service, 'ml-provider-stub');
 });

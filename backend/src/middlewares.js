@@ -1,8 +1,8 @@
 import cors from 'cors';
 import express from 'express';
+import rateLimit from 'express-rate-limit';
 import helmet from 'helmet';
 import morgan from 'morgan';
-import rateLimit from 'express-rate-limit';
 import { config } from './config.js';
 
 export const commonMiddlewares = [
@@ -15,6 +15,22 @@ export const commonMiddlewares = [
     max: config.rateLimitMax,
     standardHeaders: true,
     legacyHeaders: false,
+    skip: (req) => {
+      const path = req.path || '';
+      if (path === '/api/v1/ml/train-step') return true;
+      if (path === '/api/v1/ml/save-model') return true;
+      if (path === '/api/v1/ml/health') return true;
+      if (path === '/api/v1/sim/bridge/health') return true;
+      return false;
+    },
+    handler: (req, res) => {
+      return res.status(429).json({
+        error: {
+          code: 'RATE_LIMITED',
+          message: 'Too many requests. Please slow down and retry.',
+        },
+      });
+    },
   }),
 ];
 

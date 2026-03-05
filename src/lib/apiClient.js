@@ -15,12 +15,18 @@ async function request(path, options = {}) {
 
   if (!response.ok) {
     let payload;
+    const contentType = response.headers.get('content-type') || '';
     try {
-      payload = await response.json();
+      if (contentType.includes('application/json')) {
+        payload = await response.json();
+      } else {
+        const rawText = await response.text();
+        payload = { error: { message: rawText || `HTTP ${response.status}` } };
+      }
     } catch {
-      payload = { error: { message: 'Unexpected API error.' } };
+      payload = { error: { message: `HTTP ${response.status} ${response.statusText}` } };
     }
-    throw new Error(payload.error?.message || 'API request failed');
+    throw new Error(payload.error?.message || `API request failed (${response.status})`);
   }
 
   return response.json();
@@ -44,4 +50,8 @@ export const apiClient = {
   getSimBridgeHealth: () => request('/sim/bridge/health'),
   getSimRunSnapshot: (runId) => request(`/sim/runs/${runId}/snapshot`),
   stepSimRun: (runId) => request(`/sim/runs/${runId}/step`, { method: 'POST' }),
+  mlHealth: () => request('/ml/health'),
+  mlTrainStep: (payload) => request('/ml/train-step', { method: 'POST', body: JSON.stringify(payload) }),
+  mlSaveModel: (payload) => request('/ml/save-model', { method: 'POST', body: JSON.stringify(payload) }),
+  mlGetModel: (id) => request(`/ml/models/${id}`),
 };

@@ -6,6 +6,10 @@ const MODEL_PRESETS = {
   hybrid: { alpha: 0.25, gamma: 0.95, epsilon: 0.26, epsilonMin: 0.03, epsilonDecay: 0.9962, stepSize: 0.9 },
 };
 
+const MAX_POLICY_STATES = 5000;
+const POLICY_PRUNE_BATCH = 200;
+const MAX_MEMORY_BUFFER = 12000;
+
 function getAgentAndGoalIndices(objects) {
   const agentIndex = objects.findIndex((item) => item.agent && Array.isArray(item.pos));
   const goalIndex = objects.findIndex((item) => {
@@ -17,12 +21,29 @@ function getAgentAndGoalIndices(objects) {
   return { agentIndex, goalIndex };
 }
 
-function stateKey(agentPos, goalPos, is2D) {
+function quantize(value, step, min, max) {
+  const bounded = Math.max(min, Math.min(max, value));
+  return Math.round(bounded / step) * step;
+}
+
+function stateKey(agentPos, goalPos, is2D, featureSet = null) {
   const deltaX = Math.max(-20, Math.min(20, Math.round(goalPos[0] - agentPos[0])));
   const deltaSecondAxis = is2D
     ? Math.max(-20, Math.min(20, Math.round(goalPos[1] - agentPos[1])))
     : Math.max(-20, Math.min(20, Math.round(goalPos[2] - agentPos[2])));
-  return `${deltaX}|${deltaSecondAxis}`;
+
+  if (!featureSet) {
+    return `${deltaX}|${deltaSecondAxis}`;
+  }
+
+  return [
+    deltaX,
+    deltaSecondAxis,
+    quantize(featureSet.distanceToGoal || 0, 0.5, 0, 80),
+    quantize(featureSet.angleToGoal || 0, 0.25, -Math.PI, Math.PI),
+    quantize(featureSet.obstacleClearance || 0, 0.25, -6, 12),
+    quantize(featureSet.velocityMagnitude || 0, 0.1, 0, 12),
+  ].join('|');
 }
 
 function clamp(value, min = -1, max = 1) {
@@ -83,6 +104,12 @@ function distance2D(a, b, is2D) {
 
 function bounded(position, limit = 40) {
   return Math.max(-limit, Math.min(limit, position));
+}
+
+function signedAngleToGoal(agentPos, goalPos, is2D) {
+  const deltaX = goalPos[0] - agentPos[0];
+  const deltaSecondAxis = is2D ? (goalPos[1] - agentPos[1]) : (goalPos[2] - agentPos[2]);
+  return Math.atan2(deltaSecondAxis, deltaX);
 }
 
 function randomGoal(is2D, referenceAxis = 0.5, randomFn) {
@@ -178,7 +205,43 @@ export function createTrainingEngine(model = 'ppo', options = {}) {
     deterministic,
     seed: deterministic ? Number(options.seed) || null : null,
     random: deterministic ? seededRandom : Math.random,
+    memory: [],
+    previousVelocityMagnitude: 0,
   };
+}
+
+function computeStateFeatures({ objects, agentIndex, goalIndex, point, is2D, velocityMagnitude }) {
+  const goal = objects[goalIndex];
+  const distanceToGoal = distance2D(point, goal.pos, is2D);
+  const angleToGoal = signedAngleToGoal(point, goal.pos, is2D);
+  const clearanceRaw = obstacleClearance(objects, agentIndex, goalIndex, point, is2D);
+
+  return {
+    distanceToGoal,
+    angleToGoal,
+    obstacleClearance: Number.isFinite(clearanceRaw) ? clearanceRaw : 9,
+    velocityMagnitude,
+  };
+}
+
+function prunePolicyTable(policyTable) {
+  if (!(policyTable instanceof Map)) return;
+  if (policyTable.size <= MAX_POLICY_STATES) return;
+
+  const entries = Array.from(policyTable.entries())
+    .sort((a, b) => {
+      const visitsA = Number(a?.[1]?.visits) || 0;
+      const visitsB = Number(b?.[1]?.visits) || 0;
+      if (visitsA !== visitsB) return visitsA - visitsB;
+      const valueA = Number(a?.[1]?.value) || 0;
+      const valueB = Number(b?.[1]?.value) || 0;
+      return valueA - valueB;
+    });
+
+  const removeCount = Math.min(POLICY_PRUNE_BATCH, policyTable.size - MAX_POLICY_STATES);
+  for (let i = 0; i < removeCount; i += 1) {
+    policyTable.delete(entries[i][0]);
+  }
 }
 
 export function runTrainingStep(objects, engine, options = {}) {
@@ -194,7 +257,16 @@ export function runTrainingStep(objects, engine, options = {}) {
   const agent = objects[agentIndex];
   const goal = objects[goalIndex];
   const is2D = Boolean(options.is2D || agent?.is2D || goal?.is2D);
-  const currentState = stateKey(agent.pos, goal.pos, is2D);
+  const rawVelocityMagnitude = Number(engine.previousVelocityMagnitude) || 0;
+  const currentFeatures = computeStateFeatures({
+    objects,
+    agentIndex,
+    goalIndex,
+    point: agent.pos,
+    is2D,
+    velocityMagnitude: rawVelocityMagnitude,
+  });
+  const currentState = stateKey(agent.pos, goal.pos, is2D, currentFeatures);
   const guidance = directionSignal(agent.pos, goal.pos, is2D);
   const currentPolicy = getPolicyState(engine.policyTable, currentState, engine.random, guidance);
   currentPolicy.visits += 1;
@@ -204,6 +276,7 @@ export function runTrainingStep(objects, engine, options = {}) {
   const throttle = Number(control.throttle.toFixed(3));
   const controlMagnitude = Math.max(0.1, Math.hypot(steering, throttle));
   const stepMagnitude = engine.stepSize * (0.45 + Math.min(1, controlMagnitude) * 0.55);
+  engine.previousVelocityMagnitude = stepMagnitude;
 
   const prevDist = distance2D(agent.pos, goal.pos, is2D);
   const nextPos = is2D
@@ -258,7 +331,15 @@ export function runTrainingStep(objects, engine, options = {}) {
     nextGoalPos = randomGoal(is2D, goal.pos[2] ?? agent.pos[2] ?? 0.5, engine.random);
   }
 
-  const nextState = stateKey(effectiveNextPos, nextGoalPos, is2D);
+  const nextFeatures = computeStateFeatures({
+    objects,
+    agentIndex,
+    goalIndex,
+    point: effectiveNextPos,
+    is2D,
+    velocityMagnitude: stepMagnitude,
+  });
+  const nextState = stateKey(effectiveNextPos, nextGoalPos, is2D, nextFeatures);
   const nextGuidance = directionSignal(effectiveNextPos, nextGoalPos, is2D);
   const nextPolicy = getPolicyState(engine.policyTable, nextState, engine.random, nextGuidance);
 
@@ -268,8 +349,28 @@ export function runTrainingStep(objects, engine, options = {}) {
 
   const steeringError = guidance.steering - steering;
   const throttleError = guidance.throttle - throttle;
-  currentPolicy.steer = clamp(currentPolicy.steer + engine.actorRate * tdError * steeringError);
-  currentPolicy.throttle = clamp(currentPolicy.throttle + engine.actorRate * tdError * throttleError);
+  const newSteer = clamp(currentPolicy.steer + engine.actorRate * tdError * steeringError);
+  const newThrottle = clamp(currentPolicy.throttle + engine.actorRate * tdError * throttleError);
+  currentPolicy.steer = clamp(currentPolicy.steer * 0.8 + newSteer * 0.2);
+  currentPolicy.throttle = clamp(currentPolicy.throttle * 0.8 + newThrottle * 0.2);
+
+  if (Array.isArray(engine.memory)) {
+    engine.memory.push({
+      state: currentState,
+      action: {
+        steering,
+        throttle,
+        explore: control.explore,
+      },
+      reward: Number(reward.toFixed(3)),
+      nextState,
+    });
+    if (engine.memory.length > MAX_MEMORY_BUFFER) {
+      engine.memory.splice(0, engine.memory.length - MAX_MEMORY_BUFFER);
+    }
+  }
+
+  prunePolicyTable(engine.policyTable);
 
   engine.epsilon = Math.max(engine.epsilonMin, engine.epsilon * engine.epsilonDecay);
   engine.episodeReward += reward;

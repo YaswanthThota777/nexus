@@ -1,5 +1,9 @@
 import { useCallback, useEffect, useState } from 'react';
-import { deleteModel as storageDelete, getModels as storageGet } from '../lib/modelStorage';
+import {
+    MODELS_UPDATED_EVENT,
+    deleteModel as storageDelete,
+    getModels as storageGet,
+} from '../lib/modelStorage';
 
 export function useModels(projectId, engineRef, onLoad) {
   const [models, setModels] = useState([]);
@@ -16,15 +20,23 @@ export function useModels(projectId, engineRef, onLoad) {
     refreshModels();
   }, [refreshModels]);
 
+  useEffect(() => {
+    const handleModelsUpdated = () => refreshModels();
+    window.addEventListener(MODELS_UPDATED_EVENT, handleModelsUpdated);
+    return () => window.removeEventListener(MODELS_UPDATED_EVENT, handleModelsUpdated);
+  }, [refreshModels]);
+
   const loadModel = useCallback((modelId) => {
-    if (!projectId || !engineRef?.current) return;
+    if (!projectId) return;
     const model = storageGet(projectId).find((m) => m.id === modelId);
     if (!model) return;
-    const engine = engineRef.current;
-    engine.policyTable = new Map(model.policyTable || []);
-    engine.epsilon = model.engineState?.epsilon ?? engine.epsilon;
-    engine.episode = model.engineState?.episode ?? engine.episode;
-    engine.totalSteps = model.engineState?.totalSteps ?? engine.totalSteps;
+    const engine = engineRef?.current;
+    if (engine) {
+      engine.policyTable = new Map(model.policyTable || []);
+      engine.epsilon = model.engineState?.epsilon ?? engine.epsilon;
+      engine.episode = model.engineState?.episode ?? engine.episode;
+      engine.totalSteps = model.engineState?.totalSteps ?? engine.totalSteps;
+    }
     if (typeof onLoad === 'function') onLoad(model);
   }, [engineRef, onLoad, projectId]);
 

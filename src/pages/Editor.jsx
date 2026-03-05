@@ -4,38 +4,69 @@ import { useActiveProject } from '../hooks/useActiveProject';
 import { clearEngine, loadEngine, saveEngine } from '../lib/enginePersistence';
 import { saveModel } from '../lib/modelStorage';
 import { updateProject } from '../lib/projectStorage';
-import { createTrainingEngine, runTrainingStep } from '../lib/realTrainingEngine';
+import { LightweightProvider } from '../lib/providers/lightweightProvider';
+import { createTrainingEngine } from '../lib/realTrainingEngine';
+// the provider abstraction allows swapping in a remote ML backend later
+
 
 // Simplified editor shell to demonstrate integration
 export default function Editor() {
   const { project, refreshActive } = useActiveProject();
   const [objects, setObjects] = useState([]);
-  const [engine, setEngine] = useState(null);
+  const [engine, setEngine] = useState(null); // kept for display/persistence
+  const providerRef = useRef(null);
   const loopRef = useRef(null);
 
+  // when project changes initialize provider/engine and restore any persisted state
   useEffect(() => {
     if (!project) return;
     setObjects(project.objects || []);
-    const restored = loadEngine(project.id, () => createTrainingEngine('ppo'));
-    setEngine(restored || createTrainingEngine('ppo'));
+
+    // restore raw engine state (policy table etc) via legacy persistence helper
+    const restoredEngine = loadEngine(project.id, () => createTrainingEngine('ppo'));
+
+    // create lightweight provider – current default for the simplified editor
+    const provider = new LightweightProvider('ppo');
+    provider.init({ is2D: project.is2D });
+
+    if (restoredEngine) {
+      // copy over restored state into provider engine
+      provider.engine = restoredEngine;
+    }
+
+    providerRef.current = provider;
+    const eng = provider.getEngine();
+    setEngine(eng);
   }, [project]);
 
+  // training loop powered by provider.step – backwards compatible with lightweight engine
   useEffect(() => {
-    if (!project || !engine) return;
+    if (!project || !providerRef.current) return;
+
     loopRef.current = setInterval(() => {
-      const result = runTrainingStep(objects, engine, { is2D: project.is2D });
-      if (result.objects) setObjects(result.objects);
-      if (result.stepMetrics?.totalSteps) engine.totalSteps = result.stepMetrics.totalSteps;
-      saveEngine(project.id, engine);
-      if (result.episodePoint?.solved) {
-        saveModel(project.id, engine, {
-          reward: result.episodePoint.reward,
-          successRate: result.stepMetrics?.successRate || 0,
-        });
-      }
+      const provider = providerRef.current;
+      provider.step({ objects, is2D: project.is2D }).then((result) => {
+        if (result.objects) setObjects(result.objects);
+
+        // keep engine state in sync for persistence / UI
+        const eng = provider.getEngine();
+        if (result.stepMetrics?.totalSteps) eng.totalSteps = result.stepMetrics.totalSteps;
+        setEngine(eng);
+
+        saveEngine(project.id, eng);
+
+        if (result.episodePoint?.solved) {
+          saveModel(project.id, eng, {
+            reward: result.episodePoint.reward,
+            successRate: result.stepMetrics?.successRate || 0,
+          });
+        }
+      }).catch((err) => {
+        console.error('training step failed', err);
+      });
     }, 200);
     return () => clearInterval(loopRef.current);
-  }, [project, engine, objects]);
+  }, [project, objects]);
 
   // Save objects and engine when leaving
   useEffect(() => {

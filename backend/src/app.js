@@ -1,10 +1,11 @@
 import express from 'express';
 import { commonMiddlewares, requireApiKey } from './middlewares.js';
+import { mlRouter } from './routes/ml.js';
+import { modelsRouter } from './routes/models.js';
 import { projectsRouter } from './routes/projects.js';
 import { runsRouter } from './routes/runs.js';
-import { modelsRouter } from './routes/models.js';
-import { templatesRouter } from './routes/templates.js';
 import { simRouter } from './routes/sim.js';
+import { templatesRouter } from './routes/templates.js';
 
 export function createApp() {
   const app = express();
@@ -20,6 +21,7 @@ export function createApp() {
   app.use('/api/v1/models', modelsRouter);
   app.use('/api/v1/templates', templatesRouter);
   app.use('/api/v1/sim', simRouter);
+  app.use('/api/v1/ml', mlRouter);
 
   app.use((req, res) => {
     res.status(404).json({
